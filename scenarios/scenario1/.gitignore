@@ -1,0 +1,43 @@
+# Build artifacts
+speedometer
+cpu_workload
+memory_workload
+io_workload
+misbehaving_app
+*.o
+*.a
+*.so
+*.dylib
+
+# CMake
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile.cmake
+*.cmake
+!CMakeLists.txt
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Output files
+*.csv
+*.log
+*.dat
+*.tmp
+io_workload_temp.dat
+misbehaving_io_*.tmp
+
+# Debug
+*.dSYM/
+core
+vgcore.*
+
+# OS files
+.DS_Store
+Thumbs.db
