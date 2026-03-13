@@ -9,7 +9,7 @@ The experimental setup uses the **EB corbos Linux template workspace** (v1.6.0),
 **Official Support:** Ubuntu 22.04 on x86_64 (amd64) host machines  
 **Alternative Support:** Currently, the platform is not suitable for arm64 hosts:
 - `lisa-elf-enabler:arm64` is a crucial package for high-integrity applications, currently missing from Elektrobit’s repositories---
----
+
 
 ## Base Setup Steps
 
