@@ -1,7 +1,7 @@
 1. Problem Statement
 "To what extent does EBcLfSA's hypervisor-based partitioning ensure that the timing behaviour of a high-integrity periodic task (speedometer) remains within its specified deadline when subjected to varying levels and types of interference from a concurrent low-integrity workload (stressor) targeting shared hardware resources?”
 
-3. Variables
+2. Variables
 
 Independent variables (factors):
 •  Number of repetitions per scenario: 10 runs

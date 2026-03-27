@@ -4,7 +4,7 @@
 
 ## Overview
 
-The experimental setup uses the **EB corbos Linux template workspace** (v1.6.0), publicly available at `https://github.com/Elektrobit/ebcl_template`. The workspace integrates with Visual Studio Code and includes a pre-configured dev container supporting automated build, deployment, and debugging via Taskfiles.
+The experimental setup uses the **EB corbos Linux template workspace** (v1.8.0), publicly available at `https://github.com/Elektrobit/ebcl_template`. The workspace integrates with Visual Studio Code and includes a pre-configured dev container supporting automated build, deployment, and debugging via Taskfiles.
 
 **Official Support:** Ubuntu 22.04 on x86_64 (amd64) host machines  
 **Alternative Support:** Currently, the platform is not suitable for arm64 hosts:
@@ -38,7 +38,7 @@ On remote machine (macOS), install:
 SSH into VM and clone template repository:
 
 ```bash
-git clone --branch v1.6.0 https://github.com/Elektrobit/ebcl_template
+git clone --branch v1.8.0 https://github.com/Elektrobit/ebcl_template
 ```
 
 Open workspace in VSCode:
@@ -109,6 +109,10 @@ Copy and paste the scenarios folders into `workspace/apps`. Make sure to include
 
 
 ### Modify the Image
+
+Copy and paste the image folder (`ebclfsa`) into `workspace/images/arm64/qemu`(overwritting the `ebclfsa`demo image folder)
+
+There are some significant differences between the two image folders:
 
 In `/workspace/images/arm64/qemu/ebclfsa/hi/config_root.sh`:
 	comment `chmod +x /hi_main /hi_forward`

@@ -239,6 +239,10 @@ int main(int argc, char *argv[]) {
         printf("Jitter:\n");
         printf("  Mean: %.3f us\n", stats.mean_jitter_us);
         printf("  Max: %.3f us\n", stats.max_jitter_ns / 1e3);
+        printf("Response time:\n");
+        printf("  Mean: %.3f us\n", stats.mean_response_us);
+        printf("  Min: %.3f us\n", stats.min_response_ns / 1e3);
+        printf("  Max: %.3f us\n", stats.max_response_ns / 1e3);
         printf("====================================================\n");
     } else {
         printf("WARNING: Did not receive statistics from speedometer\n");
