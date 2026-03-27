@@ -15,6 +15,7 @@ add_executable(speedometer speedometer.c)
 target_link_libraries(speedometer
     PRIVATE
         Threads::Threads
+	shmlib
         m
         rt  # POSIX real-time extensions
 )
