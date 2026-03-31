@@ -18,7 +18,7 @@ from collections import defaultdict
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-DEADLINE_US = 30000.0  # 30ms deadline in microseconds
+DEADLINE_US = 10000.0  # 30ms deadline in microseconds
 
 SCENARIO_ORDER = [
     "S0_baseline",
