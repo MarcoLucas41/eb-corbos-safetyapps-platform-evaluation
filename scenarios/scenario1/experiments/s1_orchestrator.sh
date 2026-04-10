@@ -41,8 +41,7 @@ SCENARIO_NAMES=(
     "S2_cache"
     "S3_stream"
     "S4_io"
-    "S5_cache_stream"
-    "S6_worst_case"
+    "S5_worst_case"
 )
 
 declare -A SCENARIO_PARAMS
@@ -51,8 +50,7 @@ SCENARIO_PARAMS[S1_cpu]="-c 0"
 SCENARIO_PARAMS[S2_cache]="-C 2"
 SCENARIO_PARAMS[S3_stream]="-S 2"
 SCENARIO_PARAMS[S4_io]="-i 4"
-SCENARIO_PARAMS[S5_cache_stream]="-C 2 -S 2"
-SCENARIO_PARAMS[S6_worst_case]="-c 0 -C 2 -S 2 -v 2 -i 2"
+SCENARIO_PARAMS[S5_worst_case]="-c 0 -C 2 -S 2 -i 2"
 
 # ─── Argument Parsing ────────────────────────────────────────────────────────
 
@@ -227,7 +225,7 @@ run_scenario() {
         # AND as a separate file for independent analysis.
         local monitor_duration=$((DURATION + 30))
         local vmstat_file="$scenario_dir/run_${run_num}_vmstat.csv"
-        run_ssh "vmstat 1 $monitor_duration > /tmp/vmstat_out.txt 2>&1 &
+        run_ssh "vmstat -n -t 1 $monitor_duration > /tmp/vmstat_out.txt 2>&1 &
                  VPID=\$!;
                  $cmd;
                  kill \$VPID 2>/dev/null; wait \$VPID 2>/dev/null;

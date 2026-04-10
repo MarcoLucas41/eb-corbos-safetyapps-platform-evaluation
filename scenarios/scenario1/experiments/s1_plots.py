@@ -60,38 +60,39 @@ def parse_run_file(filepath):
         stats["deadline_misses"] = int(m.group(1))
         stats["deadline_miss_pct"] = float(m.group(2))
 
-    # Execution time
-    m = re.search(r"Execution time:\s*\n\s*Mean:\s+([0-9.]+)\s+us", text)
+    # Execution time — matches both "Execution time:" (stress_workload)
+    # and "Execution Time (μs):" (speedometer_li); unit suffix is optional
+    m = re.search(r"Execution [Tt]ime[^:]*:\s*\n\s*Mean:\s+([0-9.]+)", text)
     if m:
         stats["exec_mean_us"] = float(m.group(1))
 
-    m = re.search(r"Execution time:.*?Min:\s+([0-9.]+)\s+us", text, re.DOTALL)
+    m = re.search(r"Execution [Tt]ime[^:]*:.*?Min:\s+([0-9.]+)", text, re.DOTALL)
     if m:
         stats["exec_min_us"] = float(m.group(1))
 
-    m = re.search(r"Execution time:.*?Max:\s+([0-9.]+)\s+us", text, re.DOTALL)
+    m = re.search(r"Execution [Tt]ime[^:]*:.*?Max:\s+([0-9.]+)", text, re.DOTALL)
     if m:
         stats["exec_max_us"] = float(m.group(1))
 
-    # Jitter
-    m = re.search(r"Jitter:\s*\n\s*Mean:\s+([0-9.]+)\s+us", text)
+    # Jitter — matches both "Jitter:" and "Jitter (μs):"
+    m = re.search(r"Jitter[^:]*:\s*\n\s*Mean:\s+([0-9.]+)", text)
     if m:
         stats["jitter_mean_us"] = float(m.group(1))
 
-    m = re.search(r"Jitter:.*?Max:\s+([0-9.]+)\s+us", text, re.DOTALL)
+    m = re.search(r"Jitter[^:]*:.*?Max:\s+([0-9.]+)", text, re.DOTALL)
     if m:
         stats["jitter_max_us"] = float(m.group(1))
 
-    # Response time
-    m = re.search(r"Response time:\s*\n\s*Mean:\s+([0-9.]+)\s+us", text)
+    # Response time — matches both "Response time:" and "Response Time (μs):"
+    m = re.search(r"Response [Tt]ime[^:]*:\s*\n\s*Mean:\s+([0-9.]+)", text)
     if m:
         stats["resp_mean_us"] = float(m.group(1))
 
-    m = re.search(r"Response time:.*?Min:\s+([0-9.]+)\s+us", text, re.DOTALL)
+    m = re.search(r"Response [Tt]ime[^:]*:.*?Min:\s+([0-9.]+)", text, re.DOTALL)
     if m:
         stats["resp_min_us"] = float(m.group(1))
 
-    m = re.search(r"Response time:.*?Max:\s+([0-9.]+)\s+us", text, re.DOTALL)
+    m = re.search(r"Response [Tt]ime[^:]*:.*?Max:\s+([0-9.]+)", text, re.DOTALL)
     if m:
         stats["resp_max_us"] = float(m.group(1))
 
@@ -211,39 +212,38 @@ def parse_cycles_csv(filepath):
     return rows
 
 
-def parse_vmstat(run_file):
-    """Extract vmstat rows from a run_XX.txt file (between VMSTAT markers)."""
+def parse_vmstat(filepath):
+    """Parse a vmstat output file into per-second rows.
+
+    Handles repeated headers that vmstat prints every ~20 lines.
+    Returns a list of dicts with vmstat columns plus 'timestamp_s'.
+    """
     rows = []
+    cols = None
+    second = 0
     try:
-        text = Path(run_file).read_text()
-        m = re.search(r"===VMSTAT_START===\n(.+?)===VMSTAT_END===", text, re.DOTALL)
-        if not m:
-            return rows
-
-        lines = m.group(1).strip().splitlines()
-        # vmstat header: first two lines (labels), then data rows
-        # Find the header line with column names
-        header_idx = None
-        for i, line in enumerate(lines):
-            if "us" in line and "sy" in line and "id" in line:
-                header_idx = i
-                break
-        if header_idx is None:
-            return rows
-
-        cols = lines[header_idx].split()
-        second = 0
-        for line in lines[header_idx + 1:]:
-            vals = line.split()
-            if len(vals) != len(cols):
-                continue
-            try:
-                entry = {c: int(v) for c, v in zip(cols, vals)}
-                entry["timestamp_s"] = float(second)
-                rows.append(entry)
-                second += 1
-            except ValueError:
-                continue
+        with open(filepath) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                # Detect column header line (contains us, sy, id)
+                if "us" in line and "sy" in line and "id" in line:
+                    cols = line.split()
+                    continue
+                # Skip decoration lines (e.g. "procs ---memory--- ...")
+                if cols is None or not line[0].isdigit():
+                    continue
+                vals = line.split()
+                if len(vals) != len(cols):
+                    continue
+                try:
+                    entry = {c: int(v) for c, v in zip(cols, vals)}
+                    entry["timestamp_s"] = float(second)
+                    rows.append(entry)
+                    second += 1
+                except ValueError:
+                    continue
     except FileNotFoundError:
         pass
     return rows
@@ -252,7 +252,7 @@ def parse_vmstat(run_file):
 def load_timeseries(results_dir):
     """Load per-cycle and vmstat data for every run.
 
-    Returns {scenario: [(cycles_rows, vmstat_rows), ...]} — one tuple per run.
+    Returns {scenario: [(cycles_rows, vmstat_rows, run_num), ...]}.
     """
     ts_data = defaultdict(list)
     for scenario in SCENARIO_ORDER:
@@ -264,11 +264,12 @@ def load_timeseries(results_dir):
             run_num = f"{run_idx:02d}"
             run_file = scenario_dir / f"run_{run_num}.txt"
             cycles_file = scenario_dir / f"run_{run_num}_cycles.csv"
+            vmstat_file = scenario_dir / f"run_{run_num}_vmstat.csv"
             if not run_file.exists():
                 break
             cycles = parse_cycles_csv(cycles_file) if cycles_file.exists() else []
-            vmstat = parse_vmstat(run_file)
-            ts_data[scenario].append((cycles, vmstat))
+            vmstat = parse_vmstat(vmstat_file) if vmstat_file.exists() else []
+            ts_data[scenario].append((cycles, vmstat, run_num))
             run_idx += 1
     return ts_data
 
@@ -424,7 +425,7 @@ def generate_plots(results, output_dir):
 
 
 def generate_timeseries_plots(ts_data, output_dir):
-    """Generate per-scenario time-series plots (response time + resource usage)."""
+    """Generate per-run time-series plots (response time + vmstat metrics)."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -436,100 +437,109 @@ def generate_timeseries_plots(ts_data, output_dir):
 
     os.makedirs(output_dir, exist_ok=True)
 
+    scenario_colors = {
+        "S0_baseline": "#4CAF50", "S1_cpu": "#2196F3", "S2_cache": "#FF9800",
+        "S3_stream": "#9C27B0", "S4_io": "#F44336", "S5_cache_stream": "#FF5722",
+        "S6_worst_case": "#B71C1C",
+    }
+
     for scenario in SCENARIO_ORDER:
         if scenario not in ts_data or not ts_data[scenario]:
             continue
 
         label = SCENARIO_LABELS.get(scenario, scenario)
 
-        # Use the first run that has per-cycle data
-        cycles, vmstat = None, None
-        for c, v in ts_data[scenario]:
-            if c:
-                cycles, vmstat = c, v
-                break
+        for cycles, vmstat, run_num in ts_data[scenario]:
+            if not cycles:
+                continue
 
-        if not cycles:
-            continue
+            has_vmstat = bool(vmstat)
+            nrows = 3 if has_vmstat else 1
+            fig, axes = plt.subplots(nrows, 1, figsize=(14, 4 * nrows), sharex=True)
+            if nrows == 1:
+                axes = [axes]
 
-        has_vmstat = bool(vmstat)
-        nrows = 2 if has_vmstat else 1
-        fig, axes = plt.subplots(nrows, 1, figsize=(14, 5 * nrows), sharex=True)
-        if nrows == 1:
-            axes = [axes]
+            # ── Top: Response time timeline ────────────────────────────
+            ax_rt = axes[0]
+            ts = [r["timestamp_s"] for r in cycles]
+            rt = [r["response_time_us"] for r in cycles]
+            misses_ts = [r["timestamp_s"] for r in cycles if r["deadline_miss"]]
+            misses_rt = [r["response_time_us"] for r in cycles if r["deadline_miss"]]
 
-        # ── Top: Response time timeline ──────────────────────────────────
-        ax_rt = axes[0]
-        ts = [r["timestamp_s"] for r in cycles]
-        rt = [r["response_time_us"] for r in cycles]
-        misses_ts = [r["timestamp_s"] for r in cycles if r["deadline_miss"]]
-        misses_rt = [r["response_time_us"] for r in cycles if r["deadline_miss"]]
+            ax_rt.plot(ts, rt, linewidth=0.8, color="#2196F3", label="Response time")
+            ax_rt.axhline(y=DEADLINE_US, color="red", linestyle="--", linewidth=1,
+                          label=f"Deadline ({DEADLINE_US/1000:.0f} ms)")
+            if misses_ts:
+                ax_rt.scatter(misses_ts, misses_rt, color="red", s=30, zorder=5,
+                              label=f"Deadline miss ({len(misses_ts)})")
+            ax_rt.set_ylabel("Response Time (µs)")
+            ax_rt.set_title(f"{label} — Run {run_num}")
+            ax_rt.legend(loc="upper right", fontsize=8)
+            ax_rt.grid(alpha=0.3)
 
-        ax_rt.plot(ts, rt, linewidth=0.8, color="#2196F3", label="Response time")
-        ax_rt.axhline(y=DEADLINE_US, color="red", linestyle="--", linewidth=1,
-                      label=f"Deadline ({DEADLINE_US/1000:.0f} ms)")
-        if misses_ts:
-            ax_rt.scatter(misses_ts, misses_rt, color="red", s=30, zorder=5,
-                          label=f"Deadline miss ({len(misses_ts)})")
-        ax_rt.set_ylabel("Response Time (µs)")
-        ax_rt.set_title(f"{label} — Response Time & Resource Usage (run 1)")
-        ax_rt.legend(loc="upper right", fontsize=8)
-        ax_rt.grid(alpha=0.3)
+            if has_vmstat:
+                vm_ts = [r["timestamp_s"] for r in vmstat]
 
-        # ── Bottom: vmstat resource usage ────────────────────────────────
-        if has_vmstat:
-            ax_res = axes[1]
-            vm_ts = [r["timestamp_s"] for r in vmstat]
-            cpu_us = [r.get("us", 0) + r.get("sy", 0) for r in vmstat]
-            io_bi = [r.get("bi", 0) for r in vmstat]
-            io_bo = [r.get("bo", 0) for r in vmstat]
-            cs = [r.get("cs", 0) for r in vmstat]
+                # ── Middle: CPU breakdown (us, sy, id) ─────────────────
+                ax_cpu = axes[1]
+                cpu_us = [r.get("us", 0) for r in vmstat]
+                cpu_sy = [r.get("sy", 0) for r in vmstat]
+                cpu_id = [r.get("id", 0) for r in vmstat]
 
-            ax_res.plot(vm_ts, cpu_us, linewidth=1, color="#FF9800", label="CPU% (us+sy)")
-            ax_res.set_ylabel("CPU %", color="#FF9800")
-            ax_res.tick_params(axis="y", labelcolor="#FF9800")
-            ax_res.set_ylim(0, 105)
+                ax_cpu.stackplot(vm_ts, cpu_us, cpu_sy, cpu_id,
+                                 labels=["User (us)", "System (sy)", "Idle (id)"],
+                                 colors=["#FF9800", "#F44336", "#E0E0E0"], alpha=0.8)
+                ax_cpu.set_ylabel("CPU %")
+                ax_cpu.set_ylim(0, 105)
+                ax_cpu.legend(loc="upper right", fontsize=8)
+                ax_cpu.grid(alpha=0.3)
 
-            ax_io = ax_res.twinx()
-            ax_io.plot(vm_ts, io_bi, linewidth=0.8, color="#9C27B0", alpha=0.7,
-                       label="Block In")
-            ax_io.plot(vm_ts, io_bo, linewidth=0.8, color="#4CAF50", alpha=0.7,
-                       label="Block Out")
-            ax_io.set_ylabel("Block I/O (blocks/s)")
+                # Mark deadline misses
+                for mt in misses_ts:
+                    ax_cpu.axvline(x=mt, color="red", alpha=0.3, linewidth=0.7)
 
-            # Mark deadline misses on the resource plot too
-            for mt in misses_ts:
-                ax_res.axvline(x=mt, color="red", alpha=0.3, linewidth=0.7)
+                # ── Bottom: System metrics (in, cs) ───────────────────
+                ax_sys = axes[2]
+                interrupts = [r.get("in", 0) for r in vmstat]
+                ctx_switches = [r.get("cs", 0) for r in vmstat]
 
-            # Combined legend
-            lines1, labels1 = ax_res.get_legend_handles_labels()
-            lines2, labels2 = ax_io.get_legend_handles_labels()
-            ax_res.legend(lines1 + lines2, labels1 + labels2,
-                          loc="upper right", fontsize=8)
+                ax_sys.plot(vm_ts, interrupts, linewidth=1, color="#9C27B0",
+                            label="Interrupts/s (in)")
+                ax_sys.set_ylabel("Interrupts/s", color="#9C27B0")
+                ax_sys.tick_params(axis="y", labelcolor="#9C27B0")
 
-            ax_res.set_xlabel("Time (s)")
-            ax_res.grid(alpha=0.3)
-        else:
-            axes[0].set_xlabel("Time (s)")
+                ax_cs = ax_sys.twinx()
+                ax_cs.plot(vm_ts, ctx_switches, linewidth=1, color="#2196F3",
+                           label="Ctx Switches/s (cs)")
+                ax_cs.set_ylabel("Ctx Switches/s", color="#2196F3")
+                ax_cs.tick_params(axis="y", labelcolor="#2196F3")
 
-        fig.tight_layout()
-        fname = os.path.join(output_dir, f"timeseries_{scenario}.png")
-        fig.savefig(fname, dpi=150)
-        plt.close(fig)
-        print(f"  Saved: {fname}")
+                for mt in misses_ts:
+                    ax_sys.axvline(x=mt, color="red", alpha=0.3, linewidth=0.7)
 
-    # ── Combined comparison: response time envelope across scenarios ──
+                lines1, labs1 = ax_sys.get_legend_handles_labels()
+                lines2, labs2 = ax_cs.get_legend_handles_labels()
+                ax_sys.legend(lines1 + lines2, labs1 + labs2,
+                              loc="upper right", fontsize=8)
+
+                ax_sys.set_xlabel("Time (s)")
+                ax_sys.grid(alpha=0.3)
+            else:
+                axes[0].set_xlabel("Time (s)")
+
+            fig.tight_layout()
+            fname = os.path.join(output_dir, f"timeseries_{scenario}_run{run_num}.png")
+            fig.savefig(fname, dpi=150)
+            plt.close(fig)
+            print(f"  Saved: {fname}")
+
+    # ── Combined comparison: response time overlay across scenarios ────
     fig, ax = plt.subplots(figsize=(14, 6))
-    scenario_colors = {
-        "S0_baseline": "#4CAF50", "S1_cpu": "#2196F3", "S2_cache": "#FF9800",
-        "S3_stream": "#9C27B0", "S4_io": "#F44336", "S5_cache_stream": "#FF5722",
-        "S6_worst_case": "#B71C1C",
-    }
     plotted = False
     for scenario in SCENARIO_ORDER:
         if scenario not in ts_data or not ts_data[scenario]:
             continue
-        for c, _ in ts_data[scenario]:
+        for c, _, _ in ts_data[scenario]:
             if c:
                 ts = [r["timestamp_s"] for r in c]
                 rt = [r["response_time_us"] for r in c]
