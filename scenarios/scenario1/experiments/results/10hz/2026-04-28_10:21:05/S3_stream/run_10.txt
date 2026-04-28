@@ -1,0 +1,114 @@
+stress-ng: info:  [391] setting to a 60 second run per stressor
+stress-ng: info:  [391] dispatching hogs: 2 stream
+stress-ng: info:  [392] stress-ng-stream: using built-in defaults as no suitable cache found
+stress-ng: info:  [392] stress-ng-stream: stressor loosely based on a variant of the STREAM benchmark code
+stress-ng: info:  [392] stress-ng-stream: do NOT submit any of these results to the STREAM benchmark results
+stress-ng: info:  [392] stress-ng-stream: Using CPU cache size of 2048K
+stress-ng: info:  [393] stress-ng-stream: memory rate: 318.14 MB/sec, 127.25 Mflop/sec (instance 1)
+stress-ng: info:  [392] stress-ng-stream: memory rate: 310.38 MB/sec, 124.15 Mflop/sec (instance 0)
+stress-ng: info:  [391] successful run completed in 60.18s (1 min, 0.18 secs)
+stress-ng: info:  [391] stressor       bogo ops real time  usr time  sys time   bogo ops/s     bogo ops/s
+stress-ng: info:  [391]                           (secs)    (secs)    (secs)   (real time) (usr+sys time)
+stress-ng: info:  [391] stream              941     60.09    119.33      0.24        15.66           7.87
+stress-ng: info:  [391] stream           314.26 memory rate (MB per sec) (average per stressor)
+stress-ng: info:  [391] stream           125.70 memory rate (Mflop per sec) (average per stressor)
+========================================
+Stress-NG Workload (Synchronized)
+========================================
+Initializing shared memory...
+Waiting for speedometer to register...
+Found speedometer in shared memory!
+Sending START command to speedometer...
+
+Starting stress-ng workload for 60 seconds...
+Command: stress-ng --stream 2 --timeout 60s --metrics-brief
+
+
+Stress-ng completed with exit code: 0
+Sending STOP command to speedometer...
+Waiting for statistics from speedometer...
+
+========== RECEIVED SPEEDOMETER STATISTICS ==========
+Total cycles: 600
+Deadline misses: 0 (0.00%)
+Execution time:
+  Mean: 167.442 us
+  Min: 134.192 us
+  Max: 332.432 us
+Jitter:
+  Mean: 1971.047 us
+  Max: 2984.304 us
+Response time:
+  Mean: 2138.488 us
+  Min: 1567.680 us
+  Max: 3122.384 us
+====================================================
+
+Stress workload terminated.
+===VMSTAT_START===
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 1  0      0 398800  11132  30820    0    0    21     4  218   22 78  5 17  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  477  108 66 20 14  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  503   16 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  507   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  505   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0   100  503   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  511   30 99  1  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  506   21 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  507   19 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  504   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  507   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  507   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  503   16 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  506   22 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  507   16 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  508   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  503   14 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  508   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0    16  506   22 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  508   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  508   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  504   17 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  507   19 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  504   20 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  505   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  509   22 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  504   14 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  507   16 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  507   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  509   21 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  511   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  512   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  503   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  507   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  506   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  504   14 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  506   20 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  507   21 100  0  0  0  0
+ 3  0      0 372140  11132  32984    0    0     0     0  503   14 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  507   20 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  507   20 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  505   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  507   16 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  507   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  506   20 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  507   17 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  507   14 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  508   18 100  0  0  0  0
+ 2  0      0 372140  11132  32984    0    0     0     0  506   16 100  0  0  0  0
+ 2  0      0 372140  11132  32988    0    0     0   152  510   24 100  0  0  0  0
+ 2  0      0 372140  11132  32988    0    0     0     0  506   15 100  0  0  0  0
+ 2  0      0 372140  11132  32988    0    0     0     0  507   17 100  0  0  0  0
+ 2  0      0 372140  11132  32988    0    0     0     0  507   21 100  0  0  0  0
+ 2  0      0 372140  11132  32988    0    0     0     0  507   18 100  0  0  0  0
+ 2  0      0 372140  11132  32988    0    0     0     0  511   18 100  0  0  0  0
+ 2  0      0 372140  11132  32988    0    0     0     0  503   18 100  0  0  0  0
+ 2  0      0 372140  11132  32988    0    0     0     0  505   18 100  0  0  0  0
+ 2  0      0 372140  11132  32988    0    0     0     0  507   18 100  0  0  0  0
+ 2  0      0 372140  11132  32988    0    0     0     0  503   14 100  0  0  0  0
+ 2  0      0 372140  11132  32988    0    0     0     0  508   18 100  0  0  0  0
+ 1  0      0 383616  11132  32988    0    0     0     0  507   33 96  2  2  0  0
+ 0  0      0 397312  11132  30828    0    0     0     0  137  104  4 11 86  0  0
+ 0  0      0 397332  11132  30828    0    0     0     0   32   36  1  2 98  0  0
+===VMSTAT_END===
