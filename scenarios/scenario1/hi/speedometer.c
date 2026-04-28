@@ -12,6 +12,10 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <pthread.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+
 
 /* Shared memory library */
 #include "shmlib_hi_app.h"
@@ -19,11 +23,14 @@
 #include "common.h"
 
 /* Configuration constants */
-#define PERIOD_NS   50000000ULL      /* 50ms period (20Hz) */
+#define PERIOD_NS   500000000ULL      /* 500ms period (2Hz) */
 #define DEADLINE_NS 10000000ULL      /* 10ms deadline */
 #define RT_PRIORITY 99               /* Real-time priority */
 #define TEST_DURATION_SEC 60         /* Test duration in seconds */
 #define MAX_SAMPLES 100000           /* Maximum samples to store */
+
+#define VMSTAT_MAX_LINES 4096
+#define VMSTAT_LINE_LEN 256
 
 /* Global control flag */
 static volatile int g_running = 1;
@@ -63,6 +70,18 @@ typedef struct {
     uint64_t update_count;
 } speedometer_task_t;
 
+/* vmstat capture state */
+typedef struct {
+    char lines[VMSTAT_MAX_LINES][VMSTAT_LINE_LEN];
+    size_t line_count;
+    int started;
+} vmstat_capture_t;
+
+typedef struct {
+    vmstat_capture_t *capture;
+    int duration_sec;
+} vmstat_thread_args_t;
+
 /* Get current time in nanoseconds */
 static inline uint64_t get_time_ns(void) {
     struct timespec ts;
@@ -78,17 +97,33 @@ static inline struct timespec ns_to_timespec(uint64_t ns) {
     return ts;
 }
 
-/* Configure real-time scheduling */
+/* Set CPU affinity */
+// static int set_cpu_affinity(int cpu_core) {
+//     cpu_set_t cpuset;
+//     CPU_ZERO(&cpuset);
+//     CPU_SET(cpu_core, &cpuset);
+    
+//     if (sched_setaffinity(0, sizeof(cpu_set_t), &cpuset) != 0) {
+//         printf("Warning: Failed to set CPU affinity to core %d: %s\n",
+//                 cpu_core, strerror(errno));
+//         return 0;
+//     }
+    
+//     printf("CPU affinity set to core %d\n", cpu_core);
+//     return 1;
+// }
+
+// /* Configure real-time scheduling */
 // static int configure_realtime(int priority) {
 //     struct sched_param param;
 //     pid_t tid;
 //     int current_policy;
 //     struct sched_param current_param;
-    
-//     /* Get current thread ID (not process ID!) */
+
+//     /* Get current thread ID */
 //     tid = syscall(SYS_gettid);
-//     printf("\nConfiguring RT scheduling for thread TID=%d\n", tid);
-    
+//     printf("Configuring RT scheduling for thread TID=%d\n", tid);
+
 //     /* Check current scheduling policy */
 //     current_policy = sched_getscheduler(0);
 //     sched_getparam(0, &current_param);
@@ -97,51 +132,25 @@ static inline struct timespec ns_to_timespec(uint64_t ns) {
 //            current_policy == SCHED_RR ? "SCHED_RR" :
 //            current_policy == SCHED_OTHER ? "SCHED_OTHER" : "UNKNOWN",
 //            current_param.sched_priority);
-    
+
 //     /* Set RT scheduling */
 //     param.sched_priority = priority;
-    
+
 //     if (sched_setscheduler(0, SCHED_FIFO, &param) != 0) {
-//         printf("ERROR: Failed to set SCHED_FIFO: %s (errno=%d)\n", strerror(errno), errno);
-//         printf("Possible causes:\n");
-//         printf("  - CAP_SYS_NICE capability missing\n");
-//         printf("  - RLIMIT_RTPRIO too low\n");
-//         printf("  - Kernel doesn't support RT scheduling\n");
-        
-//         /* Try to get current limits */
-//         printf("\nChecking RT limits...\n");
-//         int max_rt = sched_get_priority_max(SCHED_FIFO);
-//         int min_rt = sched_get_priority_min(SCHED_FIFO);
-//         printf("  SCHED_FIFO priority range: %d - %d\n", min_rt, max_rt);
-        
+//         printf("Warning: Failed to set SCHED_FIFO: %s (errno=%d)\n", strerror(errno), errno);
+//         printf("  Running without real-time scheduling.\n");
 //         return 0;
 //     }
-    
+
 //     /* Verify it was set */
 //     current_policy = sched_getscheduler(0);
 //     sched_getparam(0, &current_param);
-//     printf("SUCCESS: Real-time scheduling configured\n");
-//     printf("  Policy: %s\n", current_policy == SCHED_FIFO ? "SCHED_FIFO" : "OTHER");
-//     printf("  Priority: %d\n", current_param.sched_priority);
-    
+//     printf("RT scheduling configured: %s priority %d\n",
+//            current_policy == SCHED_FIFO ? "SCHED_FIFO" : "OTHER",
+//            current_param.sched_priority);
+
 //     return 1;
 // }
-
-/* Set CPU affinity */
-static int set_cpu_affinity(int cpu_core) {
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(cpu_core, &cpuset);
-    
-    if (sched_setaffinity(0, sizeof(cpu_set_t), &cpuset) != 0) {
-        printf("Warning: Failed to set CPU affinity to core %d: %s\n",
-                cpu_core, strerror(errno));
-        return 0;
-    }
-    
-    printf("CPU affinity set to core %d\n", cpu_core);
-    return 1;
-}
 
 /* Initialize speedometer task */
 static void speedometer_init(speedometer_task_t *task) {
@@ -180,6 +189,81 @@ static void speedometer_execute(speedometer_task_t *task) {
     (void)critical_speed;
     
     task->update_count++;
+}
+
+
+/* Collect vmstat output in a background thread */
+static void *vmstat_collector_thread(void *arg) {
+    vmstat_thread_args_t *args = (vmstat_thread_args_t *)arg;
+    vmstat_capture_t *capture = args->capture;
+
+    int count = args->duration_sec > 0 ? (args->duration_sec + 1) : 1;
+    char command[128];
+    snprintf(command, sizeof(command), "vmstat -n 1 %d", count);
+
+    FILE *fp = popen(command, "r");
+    if (fp == NULL) {
+        capture->started = 0;
+        free(args);
+        return NULL;
+    }
+
+    capture->started = 1;
+
+    char line[VMSTAT_LINE_LEN];
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        size_t len = strcspn(line, "\r\n");
+        line[len] = '\0';
+
+        if (capture->line_count < VMSTAT_MAX_LINES) {
+            snprintf(capture->lines[capture->line_count],
+                     VMSTAT_LINE_LEN,
+                     "%s",
+                     line);
+            capture->line_count++;
+        }
+    }
+
+    (void)pclose(fp);
+    free(args);
+    return NULL;
+}
+
+/* Print captured vmstat output */
+static void dump_vmstat_to_stdout(const vmstat_capture_t *capture) {
+    printf("===VMSTAT_START===\n");
+
+    if (!capture->started || capture->line_count == 0) {
+        printf("(no vmstat data captured)\n");
+    } else {
+        for (size_t i = 0; i < capture->line_count; i++) {
+            printf("%s\n", capture->lines[i]);
+        }
+    }
+
+    printf("===VMSTAT_END===\n");
+}
+/* Start vmstat collection */
+static int start_vmstat_collection(vmstat_capture_t *capture,
+                                   int duration_sec,
+                                   pthread_t *thread_out) {
+    memset(capture, 0, sizeof(*capture));
+
+    vmstat_thread_args_t *args = malloc(sizeof(*args));
+    if (args == NULL) {
+        return -1;
+    }
+
+    args->capture = capture;
+    args->duration_sec = duration_sec;
+
+    int rc = pthread_create(thread_out, NULL, vmstat_collector_thread, args);
+    if (rc != 0) {
+        free(args);
+        return -1;
+    }
+
+    return 0;
 }
 
 /* Initialize statistics */
@@ -332,9 +416,18 @@ static bool wait_for_start_command(struct shmlib_hi_app *app) {
 static void run_realtime_loop(struct shmlib_hi_app *app, int duration_sec) {
     static statistics_t stats;
     static speedometer_task_t speedometer;
+    vmstat_capture_t vmstat_capture;
+    pthread_t vmstat_thread;
+    bool vmstat_started = false;
     
     stats_init(&stats);
     speedometer_init(&speedometer);
+
+    if (start_vmstat_collection(&vmstat_capture, duration_sec, &vmstat_thread) == 0) {
+        vmstat_started = true;
+    } else {
+        printf("Warning: failed to start vmstat collection\n");
+    }
     
     printf("\nStarting real-time loop (duration: %ds)...\n", duration_sec);
     printf("Press Ctrl+C to stop early\n\n");
@@ -410,7 +503,7 @@ static void run_realtime_loop(struct shmlib_hi_app *app, int duration_sec) {
         }
         
         /* Check for deadline miss - response time from scheduled activation */
-        uint64_t response_time = exec_end - next_wakeup;
+        uint64_t response_time = abs_jitter + execution_time;
         
         stats.sum_response_ns += response_time;
         if (response_time < stats.min_response_ns) {
@@ -427,17 +520,6 @@ static void run_realtime_loop(struct shmlib_hi_app *app, int duration_sec) {
         
         if (response_time > DEADLINE_NS) {
             stats.deadline_misses++;
-            printf("WARNING: Deadline miss at cycle %lu, response time: %.3f ms (%.3f ms over)\n",
-                   (unsigned long)stats.total_cycles,
-                   response_time / 1e6,
-                   (response_time - DEADLINE_NS) / 1e6);
-        }
-        
-        /* Progress indicator */
-        if (stats.total_cycles % 500 == 0) {
-            double elapsed = (current_time - start_time) / 1e9;
-            printf("Progress: %lu cycles, %.1fs elapsed, Speed: %.1f km/h\n",
-                   (unsigned long)stats.total_cycles, elapsed, speedometer.current_speed_kmh);
         }
         
         next_wakeup += PERIOD_NS;
@@ -445,6 +527,14 @@ static void run_realtime_loop(struct shmlib_hi_app *app, int duration_sec) {
     
     /* Display and save results */
     calculate_statistics(&stats);
+
+    if (vmstat_started) {
+        (void)pthread_join(vmstat_thread, NULL);
+        dump_vmstat_to_stdout(&vmstat_capture);
+    } else {
+        printf("===VMSTAT_START===\n(no vmstat data captured)\n===VMSTAT_END===\n");
+    }
+
     dump_csv_to_stdout(&stats);
     
     /* Send statistics back to li VM via shared memory */
@@ -473,6 +563,11 @@ static void run_realtime_loop(struct shmlib_hi_app *app, int duration_sec) {
 }
 
 int main(int argc, char *argv[]) {
+    (void)mkdir("/proc", 0555);  /* ignore if it already exists */
+    if (mount("proc", "/proc", "proc", 0, NULL) != 0) {
+        printf("Warning: Failed to mount /proc: %s\n", strerror(errno));
+    }
+
     struct shmlib_hi_app *app = NULL;
     struct shmlib_shm shm = {0};
     
@@ -486,13 +581,13 @@ int main(int argc, char *argv[]) {
     
     /* Parse command line arguments */
     int duration = TEST_DURATION_SEC;
-    int cpu_core = -1;
+    // int cpu_core = -1;
     
     for (int i = 1; i < argc; i++) {
         if ((strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--duration") == 0) && i + 1 < argc) {
             duration = atoi(argv[++i]);
         } else if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--core") == 0) && i + 1 < argc) {
-            cpu_core = atoi(argv[++i]);
+            // cpu_core = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("\nUsage: %s [options]\n", argv[0]);
             printf("Options:\n");
@@ -526,9 +621,9 @@ int main(int argc, char *argv[]) {
     
     // configure_realtime(RT_PRIORITY);
     
-    if (cpu_core >= 0) {
-        set_cpu_affinity(cpu_core);
-    }
+    // if (cpu_core >= 0) {
+    //     set_cpu_affinity(cpu_core);
+    // }
     
     /* Main loop: wait for START, run test, repeat */
     int run_count = 0;
