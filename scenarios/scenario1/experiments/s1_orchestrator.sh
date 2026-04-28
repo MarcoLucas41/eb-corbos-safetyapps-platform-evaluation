@@ -16,7 +16,7 @@ set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../../../images/arm64/qemu/ebclfsa" && pwd)"
-RESULTS_DIR="$SCRIPT_DIR/results"
+RESULTS_DIR="$SCRIPT_DIR/results/$(date +%Y-%m-%d_%H:%M:%S)"
 
 RUNS_PER_SCENARIO=10
 DURATION=60
@@ -28,7 +28,7 @@ SSH_HOST="localhost"
 SSH_PASS="linux"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 
-BOOT_MARKER="Ubuntu 22.04 LTS ebclfsa-li hvc0"
+BOOT_MARKER="Ubuntu 22.04.5 LTS ebclfsa-li hvc0"
 BOOT_TIMEOUT=180   # seconds to wait for boot
 SSH_TIMEOUT=120     # seconds to wait for SSH readiness
 
@@ -49,7 +49,7 @@ SCENARIO_PARAMS[S0_baseline]=""
 SCENARIO_PARAMS[S1_cpu]="-c 0"
 SCENARIO_PARAMS[S2_cache]="-C 2"
 SCENARIO_PARAMS[S3_stream]="-S 2"
-SCENARIO_PARAMS[S4_io]="-i 4"
+SCENARIO_PARAMS[S4_io]="-i 2"
 SCENARIO_PARAMS[S5_worst_case]="-c 0 -C 2 -S 2 -i 2"
 
 # ─── Argument Parsing ────────────────────────────────────────────────────────
@@ -94,6 +94,42 @@ check_dependencies() {
 run_ssh() {
     sshpass -p "$SSH_PASS" ssh $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "$@"
 }
+# Normalize vmstat text into clean CSV:
+# - remove ANSI escape codes
+# - remove serial prefix like "vm-hi,|," or "vm-hi |"
+# - convert whitespace-delimited vmstat rows to comma-delimited
+# - drop trailing commas
+normalize_vmstat_to_csv() {
+    awk '
+    function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+    {
+        line = $0
+        gsub(/\r/, "", line)
+
+        # Strip ANSI colors/sequences
+        gsub(/\033\[[0-9;]*[[:alpha:]]/, "", line)
+
+        # Strip QEMU serial prefixes
+        sub(/^[[:space:]]*vm-hi[[:space:]]*\|[[:space:]]*/, "", line)
+        sub(/^[[:space:]]*vm-hi,\|,/, "", line)
+
+        # Strip kernel log prefixes like "[  552.333704] random: crng init"
+        sub(/^\[[[:space:]]*[0-9.]+\][^,]*/, "", line)
+
+        line = trim(line)
+        if (line == "") next
+
+        # If not already comma-separated, convert runs of spaces/tabs to commas
+        if (line !~ /,/) {
+            gsub(/[[:space:]]+/, ",", line)
+        }
+
+        # Remove trailing commas
+        sub(/,+$/, "", line)
+
+        if (line != "") print line
+    }'
+}
 
 # ─── QEMU Lifecycle ─────────────────────────────────────────────────────────
 
@@ -109,7 +145,7 @@ start_qemu() {
     QEMU_PID=$!
 
     # Wait briefly for qemu-system-aarch64 to spawn
-    sleep 3
+    sleep 5
 
     echo "QEMU started (shell PID: $QEMU_PID)"
 }
@@ -123,8 +159,8 @@ wait_for_boot() {
             echo "Boot marker detected after ${elapsed}s."
             return 0
         fi
-        sleep 5
-        elapsed=$((elapsed + 5))
+        sleep 10
+        elapsed=$((elapsed + 10))
 
         # Check that a QEMU process is still running
         if ! pgrep -f qemu-system-aarch64 &>/dev/null; then
@@ -219,39 +255,55 @@ run_scenario() {
         # Track serial log length so we can extract new CSV data after the run
         local log_lines_before=$(wc -l < "$scenario_log" 2>/dev/null || echo 0)
 
-        # Run li_app with vmstat monitoring in the background.
+        # Run the experiment via SSH and capture output
+        # run_ssh "$cmd" > "$run_file" 2>&1
+        # local exit_code=$?
+
+         # Run li_app with vmstat monitoring in the background.
         # vmstat collects CPU / memory / IO stats every second.
         # After li_app finishes, the vmstat output is saved between markers
         # AND as a separate file for independent analysis.
         local monitor_duration=$((DURATION + 30))
         local vmstat_file="$scenario_dir/run_${run_num}_vmstat.csv"
-        run_ssh "vmstat -n -t 1 $monitor_duration > /tmp/vmstat_out.txt 2>&1 &
-                 VPID=\$!;
-                 $cmd;
-                 kill \$VPID 2>/dev/null; wait \$VPID 2>/dev/null;
-                 sync;
-                 echo '===VMSTAT_START===';
-                 cat /tmp/vmstat_out.txt;
-                 echo '===VMSTAT_END==='" > "$run_file" 2>&1
+        local speedometer_vmstat_file="$scenario_dir/run_${run_num}_speedometer_vmstat.csv"
+
+        run_ssh "vmstat -n 1 $monitor_duration > /tmp/vmstat_out.txt 2>&1 &
+                  VPID=\$!;
+                  $cmd;
+                  kill \$VPID 2>/dev/null; wait \$VPID 2>/dev/null;
+                  sync;
+                  echo '===VMSTAT_START===';
+                  cat /tmp/vmstat_out.txt;
+                  echo '===VMSTAT_END==='" > "$run_file" 2>&1
         local exit_code=$?
 
-        # Save vmstat as a separate file for easier analysis
-        if [[ -f "$run_file" ]]; then
-            sed -n '/===VMSTAT_START===/,/===VMSTAT_END===/{/===VMSTAT/d;p}' \
-                "$run_file" > "$vmstat_file"
+         # Save LI-side vmstat as real CSV (comma-separated)
+         if [[ -f "$run_file" ]]; then
+            sed -n '/===VMSTAT_START===/,/===VMSTAT_END===/{/===VMSTAT/d;p}' "$run_file" \
+                | normalize_vmstat_to_csv > "$vmstat_file"
             [[ -s "$vmstat_file" ]] || rm -f "$vmstat_file"
         fi
+
 
         # Wait for QEMU serial log to flush before extracting per-cycle CSV.
         # The hi VM dumps CSV via the serial port; QEMU may buffer the output.
         sleep 5
 
-        # Extract per-cycle CSV data from the QEMU serial log (new lines only)
+        # Extract per-cycle CSV + speedometer vmstat CSV from new serial-log lines
         if [[ -f "$scenario_log" ]]; then
-            tail -n +$((log_lines_before + 1)) "$scenario_log" 2>/dev/null | \
-                sed -n '/===CSV_START===/,/===CSV_END===/{/===CSV/d;p}' > "$cycles_file"
-            # Remove empty files
+            local log_chunk
+            log_chunk="$(mktemp)"
+
+            tail -n +$((log_lines_before + 1)) "$scenario_log" 2>/dev/null > "$log_chunk"
+
+            sed -n '/===CSV_START===/,/===CSV_END===/{/===CSV/d;p}' "$log_chunk" \ | normalize_vmstat_to_csv > "$cycles_file"
             [[ -s "$cycles_file" ]] || rm -f "$cycles_file"
+
+            sed -n '/===VMSTAT_START===/,/===VMSTAT_END===/{/===VMSTAT/d;p}' "$log_chunk" \
+                | normalize_vmstat_to_csv > "$speedometer_vmstat_file"
+            [[ -s "$speedometer_vmstat_file" ]] || rm -f "$speedometer_vmstat_file"
+
+            rm -f "$log_chunk"
         fi
 
         if [[ $exit_code -ne 0 ]]; then
@@ -259,8 +311,7 @@ run_scenario() {
         else
             # Extract key metrics for quick feedback
             local misses=$(grep -oP 'Deadline misses: \K[0-9]+' "$run_file" 2>/dev/null || echo "?")
-            local max_resp=$(grep -oP 'Response time:.*?Max:\s+\K[0-9.]+(?=\s+us)' "$run_file" 2>/dev/null || echo "?")
-            echo "OK (misses: $misses, max_response: ${max_resp} us)"
+            echo "OK (misses: $misses)"
         fi
 
         # Brief pause between runs to let the speedometer reset
@@ -317,7 +368,10 @@ main() {
     echo "Results saved to: $RESULTS_DIR"
     echo "========================================================"
     echo ""
-    echo "Next: run 'python3 experiments/analyze_results.py' to generate plots."
+    echo "Next: run 'python3 experiments/analyze_results.py' to generate summary plots."
+    echo "Generating deadline miss plots..."
+    python3 plot_deadline_misses.py "$RESULTS_DIR" --all
+    python3 s1_plots.py -r "$RESULTS_DIR"
 }
 
 main

@@ -26,8 +26,7 @@ SCENARIO_ORDER = [
     "S2_cache",
     "S3_stream",
     "S4_io",
-    "S5_cache_stream",
-    "S6_worst_case",
+    "S5_worst_case",
 ]
 
 SCENARIO_LABELS = {
@@ -36,8 +35,7 @@ SCENARIO_LABELS = {
     "S2_cache": "Cache",
     "S3_stream": "Stream",
     "S4_io": "I/O",
-    "S5_cache_stream": "Cache+Stream",
-    "S6_worst_case": "Worst Case",
+    "S5_worst_case": "Worst Case",
 }
 
 # ─── Parsing ──────────────────────────────────────────────────────────────────
@@ -192,12 +190,53 @@ def print_summary_table(results):
 # ─── Per-Cycle & Monitoring Parsing ───────────────────────────────────────────
 
 
+# Regex to strip ANSI escape codes and hypervisor serial mux prefixes
+# (e.g. "\x1b[37mvm-hi   | " added by L4/Fiasco.OC serial output)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+_VM_PREFIX_RE = re.compile(r"^vm-\S+\s*\|\s*")
+_KERNEL_PREFIX_RE = re.compile(r"^\[[\s0-9.]+\][^,]*")
+
+
+def _clean_serial_line(line):
+    """Remove ANSI codes and VM serial mux prefix from a line."""
+    line = _ANSI_RE.sub("", line)
+    line = _VM_PREFIX_RE.sub("", line)
+    line = _KERNEL_PREFIX_RE.sub("", line)
+    return line
+
+
+def _parse_hms_to_seconds(hms):
+    """Parse HH:MM:SS and return seconds from start of day."""
+    try:
+        hh, mm, ss = hms.split(":")
+        return int(hh) * 3600 + int(mm) * 60 + int(ss)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _parse_int_field(value):
+    """Parse vmstat numeric fields as int, allowing float-like tokens."""
+    try:
+        return int(value)
+    except ValueError:
+        try:
+            return int(float(value))
+        except ValueError:
+            return None
+
+
 def parse_cycles_csv(filepath):
-    """Parse a run_XX_cycles.csv file into lists of per-cycle data."""
+    """Parse a run_XX_cycles.csv file into lists of per-cycle data.
+
+    Handles raw lines that may contain ANSI escape codes and hypervisor
+    serial mux prefixes (e.g. from hi VM QEMU serial output).
+    """
     rows = []
     try:
         with open(filepath) as f:
-            reader = csv.DictReader(f)
+            # Clean every line before feeding to DictReader
+            cleaned = (_clean_serial_line(line) for line in f)
+            reader = csv.DictReader(cleaned)
             for row in reader:
                 rows.append({
                     "cycle": int(row["cycle"]),
@@ -213,46 +252,98 @@ def parse_cycles_csv(filepath):
 
 
 def parse_vmstat(filepath):
-    """Parse a vmstat output file into per-second rows.
+    """Parse vmstat CSV into rows with normalized numeric fields.
 
-    Handles repeated headers that vmstat prints every ~20 lines.
-    Returns a list of dicts with vmstat columns plus 'timestamp_s'.
+    Supports CSV files generated from both LI and speedometer outputs,
+    strips serial artifacts, handles repeated vmstat headers, and extracts
+    timestamp from the trailing HH:MM:SS field when available.
     """
     rows = []
-    cols = None
-    second = 0
+    columns = None
+    last_ts = None
+    synthetic_ts = 0.0
+
     try:
         with open(filepath) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
+            cleaned_lines = (_clean_serial_line(line) for line in f)
+            reader = csv.reader(cleaned_lines)
+
+            for raw_row in reader:
+                row = [cell.strip() for cell in raw_row if cell is not None]
+                row = [cell for cell in row if cell != ""]
+                if not row:
                     continue
-                # Detect column header line (contains us, sy, id)
-                if "us" in line and "sy" in line and "id" in line:
-                    cols = line.split()
+
+                first = row[0].lower()
+
+                # Skip vmstat decoration header lines
+                if first == "procs":
                     continue
-                # Skip decoration lines (e.g. "procs ---memory--- ...")
-                if cols is None or not line[0].isdigit():
+
+                # Detect/re-detect vmstat header line
+                if "r" in row and "us" in row and "sy" in row and "id" in row:
+                    columns = row
                     continue
-                vals = line.split()
-                if len(vals) != len(cols):
+
+                if columns is None:
                     continue
-                try:
-                    entry = {c: int(v) for c, v in zip(cols, vals)}
-                    entry["timestamp_s"] = float(second)
-                    rows.append(entry)
-                    second += 1
-                except ValueError:
+
+                values = row[:]
+
+                # vmstat with "-t" yields date + time in two fields while
+                # header may only include one timestamp column (UTC).
+                if len(values) == len(columns) + 1 and columns[-1].upper() == "UTC":
+                    values = values[:-2] + [f"{values[-2]} {values[-1]}"]
+
+                if len(values) < len(columns):
                     continue
+
+                values = values[: len(columns)]
+
+                entry = {}
+                timestamp_s = None
+                row_valid = True
+
+                for col, value in zip(columns, values):
+                    key = col.strip()
+                    if not key:
+                        continue
+
+                    if key.upper() in ("UTC", "TIMESTAMP"):
+                        time_token = value.split()[-1] if value else ""
+                        timestamp_s = _parse_hms_to_seconds(time_token)
+                        entry["timestamp_raw"] = value
+                        continue
+
+                    parsed = _parse_int_field(value)
+                    if parsed is None:
+                        row_valid = False
+                        break
+                    entry[key] = parsed
+
+                if not row_valid:
+                    continue
+
+                if timestamp_s is None:
+                    timestamp_s = synthetic_ts
+                elif last_ts is not None and timestamp_s < last_ts:
+                    # Handle wrap-around defensively.
+                    timestamp_s = float(last_ts + 1)
+
+                entry["timestamp_s"] = float(timestamp_s)
+                rows.append(entry)
+                last_ts = entry["timestamp_s"]
+                synthetic_ts += 1.0
     except FileNotFoundError:
         pass
+
     return rows
 
 
 def load_timeseries(results_dir):
     """Load per-cycle and vmstat data for every run.
 
-    Returns {scenario: [(cycles_rows, vmstat_rows, run_num), ...]}.
+    Returns {scenario: [{cycles, vmstat_li, vmstat_speedometer, run_num}, ...]}.
     """
     ts_data = defaultdict(list)
     for scenario in SCENARIO_ORDER:
@@ -265,11 +356,22 @@ def load_timeseries(results_dir):
             run_file = scenario_dir / f"run_{run_num}.txt"
             cycles_file = scenario_dir / f"run_{run_num}_cycles.csv"
             vmstat_file = scenario_dir / f"run_{run_num}_vmstat.csv"
+            speedometer_vmstat_file = scenario_dir / f"run_{run_num}_speedometer_vmstat.csv"
             if not run_file.exists():
                 break
             cycles = parse_cycles_csv(cycles_file) if cycles_file.exists() else []
-            vmstat = parse_vmstat(vmstat_file) if vmstat_file.exists() else []
-            ts_data[scenario].append((cycles, vmstat, run_num))
+            vmstat_li = parse_vmstat(vmstat_file) if vmstat_file.exists() else []
+            vmstat_speedometer = (
+                parse_vmstat(speedometer_vmstat_file)
+                if speedometer_vmstat_file.exists()
+                else []
+            )
+            ts_data[scenario].append({
+                "cycles": cycles,
+                "vmstat_li": vmstat_li,
+                "vmstat_speedometer": vmstat_speedometer,
+                "run_num": run_num,
+            })
             run_idx += 1
     return ts_data
 
@@ -423,6 +525,28 @@ def generate_plots(results, output_dir):
     plt.close(fig)
     print(f"  Saved: {output_dir}/jitter_mean_bar.png")
 
+     # ── Plot 6: Mean response time comparison (bar chart) ───────────────────────
+    resp_mean_avgs = []
+    resp_mean_stds = []
+    for s in scenarios:
+        vals = [r["resp_mean_us"] for r in results[s] if "resp_mean_us" in r]
+        avg = sum(vals) / len(vals) if vals else 0
+        std = (sum((v - avg) ** 2 for v in vals) / len(vals)) ** 0.5 if len(vals) > 1 else 0
+        resp_mean_avgs.append(avg)
+        resp_mean_stds.append(std)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.bar(labels, resp_mean_avgs, yerr=resp_mean_stds, capsize=5,
+           color=colors[: len(scenarios)], alpha=0.7, edgecolor="black")
+    ax.set_ylabel("Mean Response Time (µs)")
+    ax.set_title("Mean Response Time per Scenario (avg ± std across runs)")
+    ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "response_time_mean_bar.png"), dpi=150)
+    plt.close(fig)
+    print(f"  Saved: {output_dir}/response_time_mean_bar.png")
+
+    
 
 def generate_timeseries_plots(ts_data, output_dir):
     """Generate per-run time-series plots (response time + vmstat metrics)."""
@@ -439,8 +563,7 @@ def generate_timeseries_plots(ts_data, output_dir):
 
     scenario_colors = {
         "S0_baseline": "#4CAF50", "S1_cpu": "#2196F3", "S2_cache": "#FF9800",
-        "S3_stream": "#9C27B0", "S4_io": "#F44336", "S5_cache_stream": "#FF5722",
-        "S6_worst_case": "#B71C1C",
+        "S3_stream": "#9C27B0", "S4_io": "#F44336", "S5_worst_case": "#B71C1C",
     }
 
     for scenario in SCENARIO_ORDER:
@@ -449,11 +572,14 @@ def generate_timeseries_plots(ts_data, output_dir):
 
         label = SCENARIO_LABELS.get(scenario, scenario)
 
-        for cycles, vmstat, run_num in ts_data[scenario]:
+        for run_data in ts_data[scenario]:
+            cycles = run_data["cycles"]
+            vmstat = run_data["vmstat_li"]
+            speedometer_vmstat = run_data["vmstat_speedometer"]
+            run_num = run_data["run_num"]
             if not cycles:
                 continue
-
-            has_vmstat = bool(vmstat)
+            has_vmstat = bool(vmstat or speedometer_vmstat)
             nrows = 3 if has_vmstat else 1
             fig, axes = plt.subplots(nrows, 1, figsize=(14, 4 * nrows), sharex=True)
             if nrows == 1:
@@ -479,16 +605,29 @@ def generate_timeseries_plots(ts_data, output_dir):
 
             if has_vmstat:
                 vm_ts = [r["timestamp_s"] for r in vmstat]
+                spm_ts = [r["timestamp_s"] for r in speedometer_vmstat]
 
-                # ── Middle: CPU breakdown (us, sy, id) ─────────────────
+                # ── Middle: CPU busy from vmstat (LI + speedometer) ─────
                 ax_cpu = axes[1]
-                cpu_us = [r.get("us", 0) for r in vmstat]
-                cpu_sy = [r.get("sy", 0) for r in vmstat]
-                cpu_id = [r.get("id", 0) for r in vmstat]
-
-                ax_cpu.stackplot(vm_ts, cpu_us, cpu_sy, cpu_id,
-                                 labels=["User (us)", "System (sy)", "Idle (id)"],
-                                 colors=["#FF9800", "#F44336", "#E0E0E0"], alpha=0.8)
+                if vmstat:
+                    cpu_busy = [100 - r.get("id", 0) for r in vmstat]
+                    ax_cpu.plot(
+                        vm_ts,
+                        cpu_busy,
+                        color="#F44336",
+                        linewidth=1.2,
+                        label="LI CPU busy% (100-id)",
+                    )
+                if speedometer_vmstat:
+                    spm_busy = [100 - r.get("id", 0) for r in speedometer_vmstat]
+                    ax_cpu.plot(
+                        spm_ts,
+                        spm_busy,
+                        color="#2196F3",
+                        linewidth=1.2,
+                        linestyle="--",
+                        label="Speedometer CPU busy% (100-id)",
+                    )
                 ax_cpu.set_ylabel("CPU %")
                 ax_cpu.set_ylim(0, 105)
                 ax_cpu.legend(loc="upper right", fontsize=8)
@@ -498,28 +637,66 @@ def generate_timeseries_plots(ts_data, output_dir):
                 for mt in misses_ts:
                     ax_cpu.axvline(x=mt, color="red", alpha=0.3, linewidth=0.7)
 
-                # ── Bottom: System metrics (in, cs) ───────────────────
+                # ── Bottom: System metrics (in, cs), LI solid, speedometer dashed
                 ax_sys = axes[2]
                 interrupts = [r.get("in", 0) for r in vmstat]
                 ctx_switches = [r.get("cs", 0) for r in vmstat]
+                spm_interrupts = [r.get("in", 0) for r in speedometer_vmstat]
+                spm_ctx_switches = [r.get("cs", 0) for r in speedometer_vmstat]
 
-                ax_sys.plot(vm_ts, interrupts, linewidth=1, color="#9C27B0",
-                            label="Interrupts/s (in)")
+                # Extract optional block I/O metrics if available (bi, bo)
+                bi = [r.get("bi", 0) for r in vmstat]
+                bo = [r.get("bo", 0) for r in vmstat]
+                spm_bi = [r.get("bi", 0) for r in speedometer_vmstat]
+                spm_bo = [r.get("bo", 0) for r in speedometer_vmstat]
+
+                if vmstat:
+                    ax_sys.plot(vm_ts, interrupts, linewidth=1, color="#9C27B0",
+                                label="LI interrupts/s (in)")
+                if speedometer_vmstat:
+                    ax_sys.plot(spm_ts, spm_interrupts, linewidth=1, color="#9C27B0",
+                                linestyle="--", label="Speedometer interrupts/s (in)")
                 ax_sys.set_ylabel("Interrupts/s", color="#9C27B0")
                 ax_sys.tick_params(axis="y", labelcolor="#9C27B0")
 
                 ax_cs = ax_sys.twinx()
-                ax_cs.plot(vm_ts, ctx_switches, linewidth=1, color="#2196F3",
-                           label="Ctx Switches/s (cs)")
+                if vmstat:
+                    ax_cs.plot(vm_ts, ctx_switches, linewidth=1, color="#2196F3",
+                               label="LI ctx switches/s (cs)")
+                if speedometer_vmstat:
+                    ax_cs.plot(spm_ts, spm_ctx_switches, linewidth=1, color="#2196F3",
+                               linestyle="--", label="Speedometer ctx switches/s (cs)")
                 ax_cs.set_ylabel("Ctx Switches/s", color="#2196F3")
                 ax_cs.tick_params(axis="y", labelcolor="#2196F3")
+
+                ax_bi = ax_sys.twinx()
+                if vmstat:
+                    ax_bi.plot(vm_ts, bi, linewidth=1, color="#FF9800", label="LI block in/s (bi)")
+                if speedometer_vmstat:
+                    ax_bi.plot(spm_ts, spm_bi, linewidth=1, color="#FF9800", linestyle="--",
+                               label="Speedometer block in/s (bi)")
+                ax_bi.set_ylabel("Block In/s", color="#FF9800")
+                ax_bi.tick_params(axis="y", labelcolor="#FF9800")
+                ax_bi.spines["right"].set_position(("outward", 30))
+
+                ax_bo = ax_sys.twinx()
+                if vmstat:
+                    ax_bo.plot(vm_ts, bo, linewidth=1, color="#4CAF50", label="LI block out/s (bo)")
+                if speedometer_vmstat:
+                    ax_bo.plot(spm_ts, spm_bo, linewidth=1, color="#4CAF50", linestyle="--",
+                               label="Speedometer block out/s (bo)")
+                ax_bo.set_ylabel("Block Out/s", color="#4CAF50")
+                ax_bo.tick_params(axis="y", labelcolor="#4CAF50")
+                ax_bo.spines["right"].set_position(("outward", 60))
 
                 for mt in misses_ts:
                     ax_sys.axvline(x=mt, color="red", alpha=0.3, linewidth=0.7)
 
                 lines1, labs1 = ax_sys.get_legend_handles_labels()
                 lines2, labs2 = ax_cs.get_legend_handles_labels()
-                ax_sys.legend(lines1 + lines2, labs1 + labs2,
+                lines3, labs3 = ax_bi.get_legend_handles_labels()
+                lines4, labs4 = ax_bo.get_legend_handles_labels()
+                ax_sys.legend(lines1 + lines2 + lines3 + lines4, labs1 + labs2 + labs3 + labs4,
                               loc="upper right", fontsize=8)
 
                 ax_sys.set_xlabel("Time (s)")
@@ -539,7 +716,8 @@ def generate_timeseries_plots(ts_data, output_dir):
     for scenario in SCENARIO_ORDER:
         if scenario not in ts_data or not ts_data[scenario]:
             continue
-        for c, _, _ in ts_data[scenario]:
+        for run_data in ts_data[scenario]:
+            c = run_data["cycles"]
             if c:
                 ts = [r["timestamp_s"] for r in c]
                 rt = [r["response_time_us"] for r in c]
