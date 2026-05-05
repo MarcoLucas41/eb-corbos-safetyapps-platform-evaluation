@@ -109,6 +109,8 @@ static void write_csv(const char      *path,
 
 int main(int argc, char *argv[])
 {
+    bool        tcp_mode   = false;
+    int         nodelay   = -1;
     int         n_target  = 5000;
     int         flood_mbps = 0;
     const char *csv_path   = "net_receiver_log.csv";
@@ -116,7 +118,11 @@ int main(int argc, char *argv[])
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             n_target = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-B") == 0 && i + 1 < argc) {
+        } 
+        else if (strcmp(argv[i], "-t") == 0) {
+            tcp_mode = true;
+        }
+        else if (strcmp(argv[i], "-B") == 0 && i + 1 < argc) {
             flood_mbps = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             csv_path = argv[++i];
@@ -125,6 +131,7 @@ int main(int argc, char *argv[])
             printf("Usage: %s [options]\n", argv[0]);
             printf("  -n <count>   Packets to collect (default: 5000, max: %d)\n",
                    MAX_SAMPLES);
+            printf("  -t           Use TCP instead of UDP\n");
             printf("  -B <Mbps>    Background flood rate in Mbps (default: 0 = off)\n");
             printf("  -o <file>    Output CSV (default: net_receiver_log.csv)\n");
             printf("  -h           Show this help\n");
@@ -140,7 +147,11 @@ int main(int argc, char *argv[])
     }
 
     printf("========================================\n");
-    printf("net_receiver — Scenario 3\n");
+    if(tcp_mode) {
+        printf("net_receiver — Scenario 3 (TCP)\n");
+    } else {
+        printf("net_receiver — Scenario 3 (UDP)\n");
+    }
     printf("EB corbos Linux Network Determinism\n");
     printf("========================================\n");
     printf("Collecting:   %d packets\n",   n_target);
@@ -150,10 +161,16 @@ int main(int argc, char *argv[])
 
     /* ── Create receive socket ──────────────────────────────────────────── */
 
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int sock = socket(AF_INET, tcp_mode ? SOCK_STREAM : SOCK_DGRAM, 0);
     if (sock < 0) {
         fprintf(stderr, "ERROR: socket() failed: %s\n", strerror(errno));
         return 1;
+    }
+
+    /* Apply TCP_NODELAY on the client side as well for ACK timeliness. */
+    if(tcp_mode) {
+        nodelay = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
     }
 
     /* Larger receive buffer absorbs short bursts without dropping. */
@@ -163,14 +180,29 @@ int main(int argc, char *argv[])
     struct sockaddr_in baddr = {0};
     baddr.sin_family      = AF_INET;
     baddr.sin_port        = htons(NET_SENDER_PORT);
-    baddr.sin_addr.s_addr = INADDR_ANY;
-    if (bind(sock, (struct sockaddr *)&baddr, sizeof(baddr)) != 0) {
-        fprintf(stderr, "ERROR: bind(port %d) failed: %s\n",
-                NET_SENDER_PORT, strerror(errno));
-        return 1;
+    baddr.sin_addr.s_addr = inet_addr(NET_HI_IP);
+
+    if(tcp_mode)
+    {
+        if (connect(sock, (struct sockaddr *)&srv, sizeof(srv)) != 0) 
+        {
+            fprintf(stderr, "ERROR: connect() to %s:%d failed: %s\n",
+                NET_HI_IP, NET_SENDER_PORT, strerror(errno));
+            close(sock);
+            if (flood_pid > 0) { kill(flood_pid, SIGTERM); waitpid(flood_pid, NULL, 0); }
+            return 1;
+        }
+    }
+    else
+    {
+         if (bind(sock, (struct sockaddr *)&baddr, sizeof(baddr)) != 0) {
+            fprintf(stderr, "ERROR: bind(port %d) failed: %s\n",
+                    NET_SENDER_PORT, strerror(errno));
+            return 1;
+        }
     }
 
-    /* SO_RCVTIMEO lets us detect a stalled sender without blocking forever. */
+    /* SO_RCVTIMEO applies a receive timeout in case it detects a stalled sender */
     struct timeval tv = {
         .tv_sec  = RECV_TIMEOUT_MS / 1000,
         .tv_usec = (RECV_TIMEOUT_MS % 1000) * 1000,
