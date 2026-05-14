@@ -22,26 +22,6 @@
 
 # install(TARGETS net_flood DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-# ── TCP variant ──────────────────────────────────────────────────────────────
-
-add_executable(net_receiver_tcp net_receiver_tcp.c)
-
-target_include_directories(net_receiver_tcp PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/../common
-)
-
-target_compile_definitions(net_receiver_tcp PRIVATE
-  NET_PAYLOAD_BYTES=${NET_PAYLOAD_BYTES}
-)
-
-target_link_libraries(net_receiver_tcp PRIVATE
-  Threads::Threads
-  m
-  rt
-)
-
-install(TARGETS net_receiver_tcp DESTINATION ${CMAKE_INSTALL_BINDIR})
-
 
 # ── Net sender on li ──────────────────────────────────────────────────────────────
 # add_executable(li_net_sender li_net_sender.c)

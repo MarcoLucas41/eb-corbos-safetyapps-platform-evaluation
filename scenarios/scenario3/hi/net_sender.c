@@ -1,173 +1,267 @@
+/*
+ * net_sender.c — Scenario 3 echo server (vm-hi)
+ *
+ * Runs as PID 1 on vm-hi.  Waits for a HELLO from the pinger on vm-li,
+ * negotiates UDP/TCP transport, then echoes every received probe back
+ * to vm-li unchanged.  vm-li measures Round-Trip Latency (RTL) on its
+ * own clock, so no cross-VM clock synchronisation is performed here.
+ *
+ * Run lifecycle (supports multiple runs per QEMU boot):
+ *   1. Create UDP socket bound to NET_HI_IP:NET_SENDER_PORT.
+ *   2. Wait for HELLO from pinger.  Extract n_probes and protocol.
+ *   3. Reply with HELLO_ACK.
+ *   4. If TCP: accept one TCP connection from pinger.
+ *   5. Echo loop: recv probe → send it back unchanged.
+ *      Break on silence (UDP) or connection close (TCP).
+ *   6. Close socket, restart from step 1.
+ */
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <time.h>
 #include <unistd.h>
 #include <errno.h>
-#include <sched.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 
 #include "common.h"
 
 static volatile int g_running = 1;
+static void sigint_handler(int sig) { (void)sig; g_running = 0; }
 
-static void sigint_handler(int sig)
+/* ── TCP helpers ──────────────────────────────────────────────────────────── */
+
+/* Receive exactly sizeof(struct net_message) bytes over TCP.
+ * Returns sizeof(msg) on success, 0 if the peer closed, -1 on error/timeout. */
+static ssize_t recv_full(int fd, struct net_message *msg)
 {
-    (void)sig;
-    g_running = 0;
-}
-
-/* ── Timing helpers ─────────────────────────────────────────────────────── */
-
-static inline uint64_t get_time_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
-
-static inline struct timespec ns_to_timespec(uint64_t ns)
-{
-    struct timespec ts;
-    ts.tv_sec  = (time_t)(ns / 1000000000ULL);
-    ts.tv_nsec = (long)(ns % 1000000000ULL);
-    return ts;
-}
-
-/* ── RT configuration ───────────────────────────────────────────────────── */
-
-static void configure_realtime(void)
-{
-    struct sched_param param;
-    param.sched_priority = 90;
-    if (sched_setscheduler(0, SCHED_FIFO, &param) != 0) {
-        /* Expected on the hi VM safety kernel (returns ENOSYS).
-         * Logged for the thesis record; execution continues as SCHED_OTHER. */
-        printf("net_sender: RT scheduling: FAILED (%s) — running as SCHED_OTHER\n",
-               strerror(errno));
-    } else {
-        printf("net_sender: RT scheduling: OK (SCHED_FIFO priority 90)\n");
+    size_t received = 0;
+    while (received < sizeof(*msg)) {
+        ssize_t r = recv(fd, (char *)msg + received, sizeof(*msg) - received, 0);
+        if (r == 0) return 0;
+        if (r < 0)  return -1;
+        received += (size_t)r;
     }
+    return (ssize_t)received;
 }
 
-/* ── Main ───────────────────────────────────────────────────────────────── */
+/* ── Main ─────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[])
 {
     (void)argc;
     (void)argv;
 
-    /* Disable stdout buffering: musl performs an ioctl on writes to a
-     * buffered stdout which is blocked by the safety kernel. */
+    /* Disable stdout buffering: required on the hi VM safety kernel. */
     setbuf(stdout, NULL);
 
     printf("========================================\n");
-    printf("net_sender — Scenario 3\n");
+    printf("net_sender (echo server) — Scenario 3\n");
     printf("EB corbos Linux Network Determinism\n");
-    printf("========================================\n");
-    printf("Source:  %s (bind)\n",       NET_HI_IP);
-    printf("Target:  %s:%d\n",           NET_LI_IP, NET_SENDER_PORT);
-    printf("Period:  %llu ms\n",         (unsigned long long)(SENDER_PERIOD_NS / 1000000ULL));
-    printf("Payload: %d B  (msg: %zu B)\n\n", NET_PAYLOAD_BYTES, sizeof(struct net_message));
+    printf("RTL mode: echoes probes from vm-li unchanged\n");
+    printf("Msg size: %zu B\n\n", sizeof(struct net_message));
 
-    /* Lock memory to prevent page faults in the hot send path.
-     * May fail with ENOSYS on the safety kernel — non-fatal. */
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
         printf("net_sender: mlockall: %s — continuing\n", strerror(errno));
-    }
 
-    configure_realtime();
     signal(SIGINT, sigint_handler);
 
-    /* ── Create and configure UDP socket ─────────────────────────────── */
-
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        printf("net_sender: ERROR: socket() failed: %s\n", strerror(errno));
-        goto idle;
-    }
-
-    /* Larger send buffer reduces the probability of ENOBUFS under load. */
-    int sndbuf = 262144; /* 256 KB */
-    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-
-    /* Bind to our own address so outgoing packets are routed through the
-     * vnet_li_hi interface rather than any other interface that may appear. */
-    struct sockaddr_in src = {0};
-    src.sin_family      = AF_INET;
-    src.sin_port        = 0; /* kernel assigns ephemeral source port */
-    src.sin_addr.s_addr = inet_addr(NET_HI_IP);
-    if (bind(sock, (struct sockaddr *)&src, sizeof(src)) != 0) {
-        /* Non-fatal: routing will still work once the interface is up. */
-        printf("net_sender: WARNING: bind(%s) failed: %s\n",
-               NET_HI_IP, strerror(errno));
-    }
-
-    /* connect() records the destination so we can use send() in the hot path. */
-    struct sockaddr_in dst = {0};
-    dst.sin_family      = AF_INET;
-    dst.sin_port        = htons(NET_SENDER_PORT);
-    dst.sin_addr.s_addr = inet_addr(NET_LI_IP);
-    if (connect(sock, (struct sockaddr *)&dst, sizeof(dst)) != 0) {
-        printf("net_sender: ERROR: connect(%s:%d) failed: %s\n",
-               NET_LI_IP, NET_SENDER_PORT, strerror(errno));
-        goto idle;
-    }
-
-    printf("net_sender: ready — starting 1 ms send loop\n\n");
-
-    /* ── Periodic send loop ───────────────────────────────────────────── */
-
     static struct net_message msg;
-    memset(msg.payload, 0xAB, sizeof(msg.payload));
+    static struct net_message ack;
+    int run_count = 0;
 
-    uint64_t seq        = 0;
-    uint64_t start_ns   = get_time_ns();
-    uint64_t next_wake  = start_ns + SENDER_PERIOD_NS;
+    /* ── Per-run loop ──────────────────────────────────────────────── */
 
     while (g_running) {
-        /* Absolute-time sleep to the next period boundary. */
-        struct timespec wake_ts = ns_to_timespec(next_wake);
-        nanosleep(&wake_ts, NULL);
 
-        /* Stamp send time as late as possible before the kernel call. */
-        msg.seq          = seq;
-        msg.send_time_ns = get_time_ns();
-
-        ssize_t n = send(sock, &msg, sizeof(msg), 0);
-        if (n < 0 && errno != ENOBUFS && errno != EAGAIN) {
-            printf("net_sender: WARNING: send() seq=%llu: %s\n",
-                   (unsigned long long)seq, strerror(errno));
+        /* Fresh UDP socket each run: SO_REUSEADDR re-bind always succeeds. */
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0) {
+            printf("net_sender: ERROR: socket() failed: %s\n", strerror(errno));
+            sleep(1);
+            continue;
         }
 
-        seq++;
-        next_wake += SENDER_PERIOD_NS;
+        int reuse = 1;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        int rcvbuf = 1 << 20;
+        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
-        /* Progress line every 10 000 packets (~10 s). */
-        if (seq % 10000 == 0) {
-            double elapsed = (double)(get_time_ns() - start_ns) / 1e9;
-            printf("net_sender: [%llu pkts sent]  elapsed=%.3f s\n",
-                   (unsigned long long)seq, elapsed);
+        struct sockaddr_in baddr = {0};
+        baddr.sin_family      = AF_INET;
+        baddr.sin_port        = htons(NET_SENDER_PORT);
+        baddr.sin_addr.s_addr = inet_addr(NET_HI_IP);
+
+        if (bind(sock, (struct sockaddr *)&baddr, sizeof(baddr)) != 0) {
+            printf("net_sender: ERROR: bind(%s:%d) failed: %s\n",
+                   NET_HI_IP, NET_SENDER_PORT, strerror(errno));
+            close(sock);
+            sleep(1);
+            continue;
         }
+
+        /* Heartbeat timeout while waiting for HELLO. */
+        struct timeval tv_wait = { .tv_sec = 5, .tv_usec = 0 };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv_wait, sizeof(tv_wait));
+
+        printf("\nnet_sender: waiting for HELLO from pinger (vm-li)...\n");
+
+        struct sockaddr_in li_addr = {0};
+        socklen_t li_len   = sizeof(li_addr);
+        uint64_t  n_probes = 5000;
+        bool      tcp_mode = false;
+        bool      got_hello = false;
+
+        /* ── Wait for HELLO ────────────────────────────────────────────────── */
+
+        while (g_running && !got_hello) {
+            ssize_t nb = recvfrom(sock, &msg, sizeof(msg), 0,
+                                  (struct sockaddr *)&li_addr, &li_len);
+            if (nb < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // printf("net_sender: still waiting for HELLO...\n");
+                    continue;
+                }
+                printf("net_sender: ERROR: recvfrom: %s\n", strerror(errno));
+                break;
+            }
+            if (nb != (ssize_t)sizeof(msg))      continue;
+            if (msg.seq != NET_CTRL_SEQ_HELLO)   continue;
+
+            tcp_mode = (msg.payload[0] != 0);
+            memcpy(&n_probes, msg.payload + 1, sizeof(uint64_t));
+            if (n_probes == 0 || n_probes > 100000)
+                n_probes = 5000;
+
+            printf("net_sender: HELLO — protocol=%s  n_probes=%llu\n",
+                   tcp_mode ? "TCP" : "UDP", (unsigned long long)n_probes);
+
+            memset(&ack, 0, sizeof(ack));
+            ack.seq        = NET_CTRL_SEQ_HELLO_ACK;
+            ack.payload[0] = tcp_mode ? 1 : 0;
+
+            if (sendto(sock, &ack, sizeof(ack), 0,
+                       (struct sockaddr *)&li_addr, li_len) < 0) {
+                printf("net_sender: WARNING: HELLO_ACK sendto failed: %s\n",
+                       strerror(errno));
+            } else {
+                printf("net_sender: HELLO_ACK sent\n");
+            }
+            got_hello = true;
+        }
+
+        if (!g_running || !got_hello) { close(sock); break; }
+
+        /* ── Switch to TCP or prepare UDP echo socket ──────────────────────── */
+
+        int data_sock;
+        if (tcp_mode) {
+            close(sock);
+            int lsock = socket(AF_INET, SOCK_STREAM, 0);
+            if (lsock < 0) {
+                printf("net_sender: ERROR: TCP socket: %s\n", strerror(errno));
+                goto idle;
+            }
+            setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+            if (bind(lsock, (struct sockaddr *)&baddr, sizeof(baddr)) != 0 ||
+                listen(lsock, 1) != 0) {
+                printf("net_sender: ERROR: TCP bind/listen: %s\n", strerror(errno));
+                close(lsock);
+                goto idle;
+            }
+            printf("net_sender: TCP listening — waiting for pinger...\n");
+            struct sockaddr_in cli = {0};
+            socklen_t cli_len = sizeof(cli);
+            data_sock = accept(lsock, (struct sockaddr *)&cli, &cli_len);
+            close(lsock);
+            if (data_sock < 0) {
+                printf("net_sender: ERROR: TCP accept: %s\n", strerror(errno));
+                goto idle;
+            }
+            int nodelay = 1;
+            setsockopt(data_sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+            printf("net_sender: TCP connection accepted (TCP_NODELAY set)\n");
+        } else {
+            /* UDP: connect() so send() targets the pinger without recvfrom overhead. */
+            struct sockaddr_in dst = li_addr;
+            dst.sin_port = htons(NET_SENDER_PORT);
+            if (connect(sock, (struct sockaddr *)&dst, sizeof(dst)) != 0) {
+                printf("net_sender: ERROR: UDP connect to pinger: %s\n", strerror(errno));
+                close(sock);
+                goto idle;
+            }
+            data_sock = sock;
+        }
+
+        /* Echo-phase recv timeout: 3 s > pinger's RECV_TIMEOUT_MS.
+         * Silence longer than this is taken as end-of-run. */
+        {
+            struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+            setsockopt(data_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        }
+
+        run_count++;
+        printf("net_sender: run #%d — echoing probes from pinger\n", run_count);
+
+        /* ── Echo loop ──────────────────────────────────────────────────────────── */
+
+        uint64_t echoed = 0;
+
+        while (g_running) {
+            ssize_t nb;
+
+            if (tcp_mode) {
+                nb = recv_full(data_sock, &msg);
+                if (nb == 0) {
+                    /* Pinger closed the connection — run complete. */
+                    printf("net_sender: TCP closed by pinger (%llu echoed)\n",
+                           (unsigned long long)echoed);
+                    break;
+                }
+            } else {
+                nb = recv(data_sock, &msg, sizeof(msg), 0);
+            }
+
+            if (nb < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    printf("net_sender: run #%d — silence, run ended (%llu echoed)\n",
+                           run_count, (unsigned long long)echoed);
+                    break;
+                }
+                printf("net_sender: ERROR: recv: %s\n", strerror(errno));
+                break;
+            }
+
+            if (nb != (ssize_t)sizeof(msg))        continue;
+            if (msg.seq >= NET_CTRL_SEQ_HELLO_ACK) continue; /* skip ctrl pkts */
+
+            /* Echo back immediately — message is NOT modified. */
+            if (send(data_sock, &msg, sizeof(msg), 0) < 0) {
+                printf("net_sender: WARNING: echo send seq=%llu: %s\n",
+                       (unsigned long long)msg.seq, strerror(errno));
+            }
+            echoed++;
+        }
+
+        printf("net_sender: run #%d complete — %llu probes echoed\n",
+               run_count, (unsigned long long)echoed);
+        close(data_sock);
     }
 
-    printf("net_sender: loop terminated — total sent: %llu\n",
-           (unsigned long long)seq);
+    printf("net_sender: terminated\n");
 
 idle:
-    /* As PID 1 the kernel panics if we exit — stay in an idle loop. */
     if (getpid() == 1) {
         printf("net_sender: running as init (PID 1) — entering idle loop\n");
-        while (1) {
-            sleep(3600);
-        }
+        while (1) sleep(3600);
     }
-
     return 0;
 }

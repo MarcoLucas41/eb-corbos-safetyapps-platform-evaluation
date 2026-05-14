@@ -1,23 +1,14 @@
 /*
- * net_sender_li.c — Scenario 3 reversed UDP direction
+ * net_sender_li.c — Scenario 3 reversed variant: pinger / RTL measurer (vm-li)
  *
- * Runs on vm-li and sends periodic UDP packets to net_receiver_hi on vm-hi
- * (li → hi direction).  This is the counterpart to the standard Scenario 3
- * setup where vm-hi sends to vm-li.
+ * Sends periodic probes to the echo server (net_receiver_hi) on vm-hi at
+ * 1 ms intervals, then receives each echo and measures Round-Trip Latency
+ * (RTL) on its own CLOCK_MONOTONIC.  Both timestamps (send + recv) are on
+ * vm-li's clock, so no cross-VM synchronisation is required.
  *
- * Advantages of running the sender on vm-li:
- *   - SCHED_FIFO is available: sender jitter is lower than on vm-hi.
- *   - clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME) works correctly on
- *     the standard Linux kernel, giving better period accuracy.
- *   - No PID 1 constraints: the process exits cleanly after the run.
+ * This is the counterpart to net_receiver.c in the normal scenario.
  *
- * Usage:
- *   net_sender_li [-d <seconds>] [-n <packets>] [-o <csv>]
- *
- * The sender embeds send_time_ns (CLOCK_MONOTONIC on vm-li) in each packet.
- * net_receiver_hi computes OWL = recv_time_hi - send_time_ns.  This is valid
- * in QEMU because both VMs share the same host ARM virtual counter and their
- * CLOCK_MONOTONIC values are effectively synchronised.
+ * Usage: net_sender_li [-n <probes>] [-B <Mbps>] [-t] [-o <csv>]
  */
 
 #define _GNU_SOURCE
@@ -31,21 +22,22 @@
 #include <errno.h>
 #include <signal.h>
 #include <sched.h>
+#include <math.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 
 #include "common.h"
 
-#define DEFAULT_DURATION_SEC 30
-#define MAX_PACKETS_PER_RUN 10000
+#define MAX_SAMPLES 10000
 
 static volatile int g_running = 1;
-
 static void sigint_handler(int sig) { (void)sig; g_running = 0; }
 
-/* ── Timing ─────────────────────────────────────────────────────────────── */
+/* ── Timing ───────────────────────────────────────────────────────────────────── */
 
 static inline uint64_t get_time_ns(void)
 {
@@ -62,109 +54,131 @@ static inline struct timespec ns_to_timespec(uint64_t ns)
     return ts;
 }
 
-/* ── RT configuration ───────────────────────────────────────────────────── */
+/* ── RT configuration ────────────────────────────────────────────────────────────── */
 
 static void configure_realtime(void)
 {
     struct sched_param param = { .sched_priority = 90 };
-    if (sched_setscheduler(0, SCHED_FIFO, &param) != 0) {
-        printf("net_sender_li: SCHED_FIFO: FAILED (%s) — running as "
-               "SCHED_OTHER\n", strerror(errno));
-    } else {
-        printf("net_sender_li: SCHED_FIFO: OK (priority 90)\n");
-    }
+    if (sched_setscheduler(0, SCHED_FIFO, &param) != 0)
+        printf("net_sender_li: SCHED_FIFO FAILED (%s) — SCHED_OTHER\n", strerror(errno));
+    else
+        printf("net_sender_li: SCHED_FIFO OK (priority 90)\n");
 }
 
-/* ── Receiver readiness handshake ───────────────────────────────────────── */
-static bool wait_for_receiver_ready(int sock, uint64_t target_packets)
+/* ── TCP helper ───────────────────────────────────────────────────────────── */
+
+static ssize_t recv_full(int fd, struct net_message *msg)
 {
-    static struct net_message probe;
-    static struct net_message reply;
-    unsigned tries = 0;
-
-    memset(&probe, 0, sizeof(probe));
-    probe.seq = NET_CTRL_SEQ_HELLO;
-    probe.send_time_ns = target_packets;
-
-    printf("li_net_sender: waiting for receiver readiness on %s:%d ...\n",
-           NET_LI_IP, NET_SENDER_PORT);
-
-    while (g_running) {
-        ssize_t n = send(sock, &probe, sizeof(probe), 0);
-        if (n < 0 && errno != ENOBUFS && errno != EAGAIN) {
-            printf("li_net_sender: WARNING: HELLO send failed: %s\n",
-                   strerror(errno));
-        }
-
-        n = recv(sock, &reply, sizeof(reply), 0);
-        if (n == (ssize_t)sizeof(reply) && reply.seq == NET_CTRL_SEQ_HELLO_ACK) {
-            if (reply.send_time_ns != target_packets) {
-                printf("li_net_sender: WARNING: ACK target mismatch (sent=%llu ack=%llu)\n",
-                       (unsigned long long)target_packets,
-                       (unsigned long long)reply.send_time_ns);
-            }
-            if (reply.send_time_ns == 0) {
-                printf("li_net_sender: ERROR: receiver ACK did not include a valid target\n");
-                return false;
-            }
-
-            printf("li_net_sender: receiver acknowledged readiness for %llu packets.\n",
-                   (unsigned long long)target_packets);
-            return true;
-        }
-
-        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            printf("li_net_sender: WARNING: HELLO wait failed: %s\n", strerror(errno));
-        }
-
-        tries++;
-        if (tries % 10 == 0) {
-            printf("li_net_sender: still waiting for receiver... (%u probes)\n", tries);
-        }
+    size_t received = 0;
+    while (received < sizeof(*msg)) {
+        ssize_t r = recv(fd, (char *)msg + received, sizeof(*msg) - received, 0);
+        if (r == 0) return 0;
+        if (r < 0)  return -1;
+        received += (size_t)r;
     }
-
-    return false;
+    return (ssize_t)received;
 }
+
+/* ── Statistics ─────────────────────────────────────────────────────────────────── */
+
+static int compare_uint64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a;
+    uint64_t y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
+static uint64_t pct(const uint64_t *sorted, size_t n, double p)
+{
+    if (n == 0) return 0;
+    size_t idx = (size_t)(p * (double)n);
+    if (idx >= n) idx = n - 1;
+    return sorted[idx];
+}
+
+static void print_metric(const char *label, const uint64_t *samples, size_t n)
+{
+    if (n == 0) { printf("%s: no samples\n", label); return; }
+
+    static uint64_t sorted[MAX_SAMPLES];
+    memcpy(sorted, samples, n * sizeof(uint64_t));
+    qsort(sorted, n, sizeof(uint64_t), compare_uint64);
+
+    double sum = 0.0;
+    for (size_t i = 0; i < n; i++) sum += (double)samples[i];
+    double mean = sum / (double)n;
+    double sq = 0.0;
+    for (size_t i = 0; i < n; i++) { double d = (double)samples[i] - mean; sq += d*d; }
+    double stddev = sqrt(sq / (double)n);
+
+    printf("%s (us):\n", label);
+    printf("  Mean: %8.3f    Std dev: %.3f\n", mean/1e3, stddev/1e3);
+    printf("  Min:  %8.3f    Max:     %.3f\n", sorted[0]/1e3, sorted[n-1]/1e3);
+    printf("  P50:  %8.3f    P95:     %.3f\n",
+           pct(sorted,n,0.50)/1e3, pct(sorted,n,0.95)/1e3);
+    printf("  P99:  %8.3f    P99.9:   %.3f\n",
+           pct(sorted,n,0.99)/1e3, pct(sorted,n,0.999)/1e3);
+}
+
+static void write_csv(const char     *path,
+                      const uint64_t *seqs,
+                      const uint64_t *send_ns,
+                      const uint64_t *recv_ns,
+                      const uint64_t *rtl_ns,
+                      const uint64_t *iaj_ns,
+                      size_t          n)
+{
+    FILE *fp = fopen(path, "w");
+    if (!fp) { printf("WARNING: open CSV '%s': %s\n", path, strerror(errno)); return; }
+    fprintf(fp, "seq,send_time_ns,recv_time_ns,rtlatency_us,iat_us\n");
+    for (size_t i = 0; i < n; i++) {
+        fprintf(fp, "%llu,%llu,%llu,%.3f,%.3f\n",
+                (unsigned long long)seqs[i],
+                (unsigned long long)send_ns[i],
+                (unsigned long long)recv_ns[i],
+                (double)rtl_ns[i] / 1e3,
+                i > 0 ? (double)iaj_ns[i - 1] / 1e3 : 0.0);
+    }
+    fclose(fp);
+    printf("CSV written to: %s\n", path);
+}
+
+/* ── Background flood helper ────────────────────────────────────────────────────── */
 
 static void start_background_flood(pid_t *flood_pid, int flood_mbps)
 {
     char bw_str[32];
     snprintf(bw_str, sizeof(bw_str), "%d", flood_mbps);
-
-    printf("Starting background flood → %s:%d at %d Mbps\n\n",
+    printf("Starting background flood → %s:%d at %d Mbps\n",
            NET_HI_IP, NET_FLOOD_PORT, flood_mbps);
-
     *flood_pid = fork();
     if (*flood_pid == 0) {
-        /* Child: exec net_flood (expected in PATH after install) */
         execlp("net_flood", "net_flood",
-               "-d", NET_HI_IP,
-               "-p", "5001",
-               "-b", bw_str,
-               NULL);
-        perror("execlp net_flood");
-        exit(1);
+               "-d", NET_HI_IP, "-p", "5001", "-b", bw_str, NULL);
+        perror("execlp net_flood"); exit(1);
     } else if (*flood_pid < 0) {
-        fprintf(stderr, "WARNING: fork for net_flood failed: %s — "
-                "continuing without flood\n", strerror(errno));
+        fprintf(stderr, "WARNING: fork net_flood: %s — continuing\n", strerror(errno));
+        *flood_pid = -1;
     } else {
-        /* Allow flood workers to ramp up before measurements start. */
         printf("Waiting 2 s for flood to ramp up...\n\n");
         sleep(2);
     }
 }
 
-/* ── Main ───────────────────────────────────────────────────────────────── */
+/* ── Main ───────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[])
 {
-    int         n_packets  = 10000;
+    bool        tcp_mode   = false;
+    int         n_probes   = 5000;
     int         flood_mbps = 0;
-    const char *csv_path     = "net_sender_li_log.csv";
+    const char *csv_path   = "net_sender_li_log.csv";
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
-            n_packets = atoi(argv[++i]);
+            n_probes = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-t") == 0) {
+            tcp_mode = true;
         } else if (strcmp(argv[i], "-B") == 0 && i + 1 < argc) {
             flood_mbps = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
@@ -172,155 +186,259 @@ int main(int argc, char *argv[])
         } else if (strcmp(argv[i], "-h") == 0 ||
                    strcmp(argv[i], "--help") == 0) {
             printf("Usage: %s [options]\n", argv[0]);
-                 printf("  -n <count> Packets to send per run (default: 10000, max: %d)\n",
-                     MAX_PACKETS_PER_RUN);
-            printf("  -o <file>  Send-side log CSV (default: "
-                   "net_sender_li_log.csv)\n");
-            printf("  -B <Mbps>  Flood rate in Mbps (default: 0 = off)\n");
-            printf("  -h         Show this help\n");
-            printf("\nSends to %s:%d at %llu ms period for the configured "
-                   "packet count.\n",
-                   NET_HI_IP, NET_SENDER_PORT,
-                   (unsigned long long)(SENDER_PERIOD_NS / 1000000ULL));
+            printf("  -n <count>  Probes to send (default: 5000, max: %d)\n", MAX_SAMPLES);
+            printf("  -t          Use TCP (default: UDP)\n");
+            printf("  -B <Mbps>   Flood rate in Mbps (default: 0 = off)\n");
+            printf("  -o <file>   Output CSV (default: net_sender_li_log.csv)\n");
+            printf("  -h          Show this help\n");
             return 0;
         }
     }
 
-    if (n_packets <= 0 || n_packets > MAX_PACKETS_PER_RUN) {
-        fprintf(stderr, "ERROR: -n must be between 1 and %d\n", MAX_PACKETS_PER_RUN);
+    if (n_probes <= 0 || n_probes > MAX_SAMPLES) {
+        fprintf(stderr, "ERROR: -n must be 1..%d\n", MAX_SAMPLES);
         return 1;
     }
 
     printf("========================================\n");
-    printf("net_sender —Scenario 3\n");
+    printf("net_sender_li (pinger) — Scenario 3 reversed\n");
     printf("EB corbos Linux Network Determinism\n");
+    printf("Metric: Round-Trip Latency (RTL)\n");
     printf("========================================\n");
-    printf("Source:  %s (bind)\n",       NET_LI_IP);
-    printf("Target:  %s:%d\n",           NET_HI_IP, NET_SENDER_PORT);
-    printf("Period:  %llu ms\n",         (unsigned long long)(SENDER_PERIOD_NS / 1000000ULL));
-    printf("Payload: %d B  (msg: %zu B)\n\n", NET_PAYLOAD_BYTES, sizeof(struct net_message));
+    printf("Target:       %s:%d\n", NET_HI_IP, NET_SENDER_PORT);
+    printf("Probes:       %d\n",    n_probes);
+    printf("Protocol:     %s\n",    tcp_mode ? "TCP" : "UDP");
+    printf("Period:       %llu ms\n",
+           (unsigned long long)(SENDER_PERIOD_NS / 1000000ULL));
+    printf("Msg size:     %zu B\n",   sizeof(struct net_message));
+    printf("Flood rate:   %d Mbps\n", flood_mbps);
+    printf("Echo timeout: %d ms\n\n", RECV_TIMEOUT_MS);
 
-    printf("Packet target: %d\n", n_packets);
-    printf("============================================\n\n");
-
-    
     configure_realtime();
     signal(SIGINT, sigint_handler);
 
-    /* ── Create UDP socket ──────────────────────────────────────────────── */
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
+        printf("net_sender_li: mlockall: %s — continuing\n", strerror(errno));
+
+    /* ── Create UDP socket for handshake ───────────────────────────────────────────────── */
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        fprintf(stderr, "ERROR: socket: %s\n", strerror(errno));
-        return 1;
-    }
+    if (sock < 0) { fprintf(stderr, "ERROR: socket: %s\n", strerror(errno)); return 1; }
 
-    /* Larger send buffer reduces the probability of ENOBUFS under load. */
-    int sndbuf = 262144; /* 256 KB */
+    int sndbuf = 262144;
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    int rcvbuf = 1 << 20;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    int reuse = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
-    /* Bind to our own address so outgoing packets are routed through the
-     * vnet_li_hi interface rather than any other interface that may appear. */
+    /* Bind to NET_LI_IP so the echo server can address our replies. */
     struct sockaddr_in src = {0};
     src.sin_family      = AF_INET;
-    src.sin_port        = 0; /* kernel assigns ephemeral source port */
+    src.sin_port        = 0;  /* kernel assigns ephemeral port */
     src.sin_addr.s_addr = inet_addr(NET_LI_IP);
-    if (bind(sock, (struct sockaddr *)&src, sizeof(src)) != 0) {
-        /* Non-fatal: routing will still work once the interface is up. */
-        printf("net_sender: WARNING: bind(%s) failed: %s\n",
-               NET_LI_IP, strerror(errno));
-    }
+    if (bind(sock, (struct sockaddr *)&src, sizeof(src)) != 0)
+        printf("net_sender_li: WARNING: bind(%s): %s\n", NET_LI_IP, strerror(errno));
 
-    /* connect() records the destination so we can use send() in the hot path. */
+    /* connect() scopes send()/recv() to the echo server. */
     struct sockaddr_in dst = {0};
     dst.sin_family      = AF_INET;
     dst.sin_port        = htons(NET_SENDER_PORT);
     dst.sin_addr.s_addr = inet_addr(NET_HI_IP);
     if (connect(sock, (struct sockaddr *)&dst, sizeof(dst)) != 0) {
-        printf("net_sender: ERROR: connect(%s:%d) failed: %s\n",
-               NET_HI_IP, NET_SENDER_PORT, strerror(errno));
+        fprintf(stderr, "ERROR: UDP connect to %s:%d: %s\n",
+                NET_HI_IP, NET_SENDER_PORT, strerror(errno));
         close(sock);
         return 1;
     }
 
-    struct timeval hello_tv = {
-        .tv_sec  = 0,
-        .tv_usec = 250000,
-    };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &hello_tv, sizeof(hello_tv));
+    /* ── HELLO handshake (UDP) ─────────────────────────────────────────────────────── */
 
+    {
+        struct timeval hello_tv = { .tv_sec = 0, .tv_usec = 250000 };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &hello_tv, sizeof(hello_tv));
 
-    /* ── Start background flood (optional) ──────────────────────────────── */
+        static struct net_message probe;
+        static struct net_message reply;
+        uint64_t n_probes_u64 = (uint64_t)n_probes;
+        unsigned tries = 0;
+        bool acked = false;
+
+        printf("Sending HELLO to %s:%d (protocol=%s)...\n",
+               NET_HI_IP, NET_SENDER_PORT, tcp_mode ? "TCP" : "UDP");
+
+        while (!acked && g_running) {
+            memset(&probe, 0, sizeof(probe));
+            probe.seq        = NET_CTRL_SEQ_HELLO;
+            probe.payload[0] = tcp_mode ? 1 : 0;
+            memcpy(probe.payload + 1, &n_probes_u64, sizeof(uint64_t));
+
+            send(sock, &probe, sizeof(probe), 0);
+
+            ssize_t nb = recv(sock, &reply, sizeof(reply), 0);
+            if (nb == (ssize_t)sizeof(reply) &&
+                reply.seq == NET_CTRL_SEQ_HELLO_ACK) {
+                tcp_mode = (reply.payload[0] != 0);
+                acked = true;
+                printf("HELLO_ACK received — protocol=%s\n",
+                       tcp_mode ? "TCP" : "UDP");
+            } else {
+                tries++;
+                if (tries % 10 == 0)
+                    printf("Still waiting for HELLO_ACK (%u tries)...\n", tries);
+            }
+        }
+
+        if (!acked) {
+            printf("net_sender_li: interrupted during handshake\n");
+            close(sock);
+            return 1;
+        }
+    }
+
+    /* ── Switch to TCP if requested ──────────────────────────────────────────────────────────── */
+
+    if (tcp_mode) {
+        close(sock);
+        sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            fprintf(stderr, "ERROR: TCP socket: %s\n", strerror(errno));
+            return 1;
+        }
+        int nodelay = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+        printf("Connecting TCP to %s:%d...\n", NET_HI_IP, NET_SENDER_PORT);
+        if (connect(sock, (struct sockaddr *)&dst, sizeof(dst)) != 0) {
+            fprintf(stderr, "ERROR: TCP connect: %s\n", strerror(errno));
+            close(sock);
+            return 1;
+        }
+        printf("TCP connected (TCP_NODELAY set)\n\n");
+    }
+
+    /* Set echo-recv timeout for the ping loop. */
+    {
+        struct timeval tv = {
+            .tv_sec  = RECV_TIMEOUT_MS / 1000,
+            .tv_usec = (RECV_TIMEOUT_MS % 1000) * 1000,
+        };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+
+    /* ── Background flood (optional) ──────────────────────────────────────────────── */
 
     pid_t flood_pid = -1;
-    if (flood_mbps > 0) {
+    if (flood_mbps > 0)
         start_background_flood(&flood_pid, flood_mbps);
-    }
 
-    /* ── Periodic send loop ─────────────────────────────────────────────── */
+    /* ── Static measurement arrays ─────────────────────────────────────────────────── */
+
+    static uint64_t rtl_ns  [MAX_SAMPLES];
+    static uint64_t iaj_ns  [MAX_SAMPLES];
+    static uint64_t seq_arr [MAX_SAMPLES];
+    static uint64_t send_arr[MAX_SAMPLES];
+    static uint64_t recv_arr[MAX_SAMPLES];
+
+    size_t   n_stored     = 0;
+    size_t   n_iaj        = 0;
+    uint64_t n_lost       = 0;
+    uint64_t prev_recv_ns = 0;
+    bool     last_was_loss = false;
 
     static struct net_message msg;
-    memset(msg.payload, 0xCD, sizeof(msg.payload));
+    static struct net_message echo;
 
-    uint64_t target_packets = (uint64_t)n_packets;
-    if (!wait_for_receiver_ready(sock, target_packets)) {
-        printf("net_sender: interrupted before receiver became ready\n");
-        close(sock);
-        return 1;
-    }
+    printf("Starting ping-echo loop (%d probes at 1 ms period)...\n\n", n_probes);
 
-    printf("li_net_sender: receiver requested %llu packets\n",
-           (unsigned long long)target_packets);
-    printf("li_net_sender: ready — starting 1 ms send loop\n\n");
+    /* ── Ping-echo loop ────────────────────────────────────────────────────────── */
 
-    uint64_t seq        = 0;
-    uint64_t send_errs  = 0;
-    uint64_t start_ns   = get_time_ns();
-    uint64_t next_wake  = start_ns + SENDER_PERIOD_NS;
+    uint64_t seq       = 0;
+    uint64_t start_ns  = get_time_ns();
+    uint64_t next_wake = start_ns + SENDER_PERIOD_NS;
 
-    /* Open a lightweight send-side log (period deviation) */
-    FILE *fp_csv = fopen(csv_path, "w");
-    if (fp_csv)
-        fprintf(fp_csv, "seq,send_time_ns,period_dev_us\n");
+    while (g_running && seq < (uint64_t)n_probes) {
 
-    uint64_t prev_send_ns = 0;
-
-    while (g_running && seq < target_packets) {
         uint64_t now = get_time_ns();
-
-        /* Absolute-time sleep: clock_nanosleep works correctly on vm-li. */
         if (now < next_wake) {
             struct timespec wake_ts = ns_to_timespec(next_wake);
             clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wake_ts, NULL);
+        } else {
+            next_wake = now; /* drop backlog: avoid catch-up burst after loss */
         }
 
+        /* ── Send probe ──────────────────────────────────────────────────────── */
+
+        memset(msg.payload, 0xCD, sizeof(msg.payload));
         msg.seq          = seq;
-        msg.send_time_ns = get_time_ns();
+        msg.send_time_ns = get_time_ns();   /* vm-li clock */
 
         if (send(sock, &msg, sizeof(msg), 0) < 0) {
-            if (errno != ENOBUFS && errno != EAGAIN) {
-                fprintf(stderr, "WARNING: send seq=%llu: %s\n",
-                        (unsigned long long)seq, strerror(errno));
-            }
-            send_errs++;
-        } else if (fp_csv && seq > 0) {
-            /* Log period deviation (actual send interval vs expected). */
-            int64_t dev = (int64_t)(msg.send_time_ns - prev_send_ns)
-                          - (int64_t)SENDER_PERIOD_NS;
-            fprintf(fp_csv, "%llu,%llu,%.3f\n",
-                    (unsigned long long)seq,
-                    (unsigned long long)msg.send_time_ns,
-                    (double)dev / 1e3);
+            if (errno != ENOBUFS && errno != EAGAIN)
+                printf("WARNING: send seq=%llu: %s\n",
+                       (unsigned long long)seq, strerror(errno));
+            n_lost++;
+            last_was_loss = true;
+            prev_recv_ns  = 0;
+            seq++;
+            next_wake += SENDER_PERIOD_NS;
+            continue;
         }
 
-        prev_send_ns = msg.send_time_ns;
+        /* ── Receive echo ───────────────────────────────────────────────────── */
+
+        ssize_t nb;
+        if (tcp_mode)
+            nb = recv_full(sock, &echo);
+        else
+            nb = recv(sock, &echo, sizeof(echo), 0);
+
+        uint64_t recv_time_ns = get_time_ns();  /* vm-li clock */
+
+        bool got_echo = (nb == (ssize_t)sizeof(echo) && echo.seq == seq);
+
+        if (!got_echo) {
+            if (nb < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+                printf("WARNING: recv echo seq=%llu: %s\n",
+                       (unsigned long long)seq, strerror(errno));
+            n_lost++;
+            last_was_loss = true;
+            prev_recv_ns  = 0;
+            seq++;
+            next_wake += SENDER_PERIOD_NS;
+            continue;
+        }
+
+        /* ── Record RTL and IAJ ──────────────────────────────────────────────── */
+
+        uint64_t rtl = recv_time_ns - echo.send_time_ns;
+
+        if (prev_recv_ns != 0 && !last_was_loss && n_iaj < MAX_SAMPLES) {
+            uint64_t iat = recv_time_ns - prev_recv_ns;
+            int64_t  dev = (int64_t)iat - (int64_t)SENDER_PERIOD_NS;
+            iaj_ns[n_iaj++] = (uint64_t)(dev < 0 ? -dev : dev);
+        }
+
+        rtl_ns  [n_stored] = rtl;
+        seq_arr [n_stored] = seq;
+        send_arr[n_stored] = echo.send_time_ns;
+        recv_arr[n_stored] = recv_time_ns;
+        n_stored++;
+
+        prev_recv_ns  = recv_time_ns;
+        last_was_loss = false;
+
+        if (n_stored % 1000 == 0)
+            printf("Progress: %zu/%d  (lost: %llu)\n",
+                   n_stored, n_probes, (unsigned long long)n_lost);
+
         seq++;
         next_wake += SENDER_PERIOD_NS;
     }
 
-    if (fp_csv) fclose(fp_csv);
+    /* TCP: close connection to signal end-of-run to echo server. */
+    if (tcp_mode) close(sock);
 
-    /* ── Stop background flood ──────────────────────────────────────────── */
+    /* ── Stop background flood ──────────────────────────────────────────────────────── */
 
     if (flood_pid > 0) {
         printf("\nStopping net_flood (PID %d)...\n", (int)flood_pid);
@@ -329,19 +447,25 @@ int main(int argc, char *argv[])
         printf("net_flood stopped.\n");
     }
 
-    double elapsed = (double)(get_time_ns() - start_ns) / 1e9;
-    printf("\nli_net_sender: done.\n");
-    printf("  Packets sent:   %llu\n",   (unsigned long long)seq);
-    printf("  Send errors:    %llu\n",   (unsigned long long)send_errs);
-    printf("  Elapsed:        %.3f s\n", elapsed);
-    if (seq < target_packets)
-        printf("  Stopped early:  %llu/%llu\n",
-               (unsigned long long)seq,
-               (unsigned long long)target_packets);
-    if (csv_path)
-        printf("  Send-side CSV:  %s\n", csv_path);
-    printf("\nResults are on vm-hi console (qemu_serial.log).\n");
+    /* ── Results ───────────────────────────────────────────────────────────────────── */
 
-    close(sock);
-    return 0;
+    double elapsed = (double)(get_time_ns() - start_ns) / 1e9;
+
+    printf("\n========== NET SENDER_LI (PINGER) RESULTS ==========\n");
+    printf("Probes sent:       %5d\n",   n_probes);
+    printf("Echoes received:   %5zu\n",  n_stored);
+    printf("Lost (no echo):    %5llu (%.3f%%)\n",
+           (unsigned long long)n_lost,
+           n_probes > 0 ? (double)n_lost / (double)n_probes * 100.0 : 0.0);
+    printf("Elapsed:           %.3f s\n", elapsed);
+
+    print_metric("RTL", rtl_ns, n_stored);
+    print_metric("IAJ", iaj_ns, n_iaj);
+
+    printf("===================================================\n");
+
+    write_csv(csv_path, seq_arr, send_arr, recv_arr, rtl_ns, iaj_ns, n_stored);
+
+    if (!tcp_mode) close(sock);
+    return (n_lost == 0) ? 0 : 1;
 }

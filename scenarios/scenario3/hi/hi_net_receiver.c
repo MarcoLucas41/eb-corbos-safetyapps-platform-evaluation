@@ -1,26 +1,22 @@
 /*
- * net_receiver_hi.c — Scenario 3 reversed UDP direction
+ * net_receiver_hi.c — Scenario 3 reversed variant: echo server (vm-hi)
  *
- * Runs as PID 1 on vm-hi.  Receives periodic UDP packets sent by
- * net_sender_li running on vm-li (li → hi direction).
+ * Runs as PID 1 on vm-hi.  Implements a ping-echo server:
+ *   - Waits for HELLO from the pinger on vm-li.
+ *   - Negotiates UDP/TCP transport via the handshake.
+ *   - Echoes every received probe back to vm-li unchanged.
  *
- * This is the inverse of the standard Scenario 3 setup (hi → li) and allows
- * direct comparison of OWL and IAJ in both traffic directions on the same
- * vnet_li_hi virtual link.
+ * vm-li measures Round-Trip Latency (RTL) on its own clock.
+ * No OWL computation or clock calibration is performed here.
  *
  * Run lifecycle (supports multiple runs per QEMU boot):
- *   1. Wait indefinitely for the first packet of a new run.
- *   2. Once the first packet arrives, collect until END_OF_RUN_TIMEOUT_MS of
- *      silence (net_sender_li has finished).
- *   3. Print statistics to stdout (captured by qemu_serial.log).
- *   4. Write per-packet CSV to /tmp/ (tmpfs — always writable on hi).
- *   5. Reset and return to step 1.
- *
- * Key differences vs. net_receiver.c (li-side UDP receiver):
- *   - Runs on vm-hi: uses setbuf(stdout, NULL), nanosleep-safe, lisa-elf-enabler
- *   - No flood subprocess (receiver side; flood would need a separate binary)
- *   - Two-phase SO_RCVTIMEO: long timeout while idle, short timeout during run
- *   - PID 1 idle loop on exit
+ *   1. Create UDP socket bound to NET_HI_IP:NET_SENDER_PORT.
+ *   2. Wait for HELLO.  Extract n_probes and protocol.
+ *   3. Reply with HELLO_ACK.
+ *   4. If TCP: accept one connection from pinger.
+ *   5. Echo loop: recv probe → send it back unchanged.
+ *      Break on silence (UDP) or connection close (TCP).
+ *   6. Close socket, loop to step 1.
  */
 
 #define _GNU_SOURCE
@@ -33,377 +29,239 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <signal.h>
-#include <math.h>
-#include <sys/wait.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <sys/mman.h>
 
 #include "common.h"
 
-/* Maximum packets stored in memory per run.  At 64 B/msg this is ~640 KB. */
-#define MAX_SAMPLES 10000
-
 static volatile int g_running = 1;
+static void sigint_handler(int sig) { (void)sig; g_running = 0; }
 
-static void sigint_handler(int sig)
+/* ── TCP helper ──────────────────────────────────────────────────────────── */
+
+static ssize_t recv_full(int fd, struct net_message *msg)
 {
-    (void)sig;
-    g_running = 0;
-}
-
-/* ── Timing helper ──────────────────────────────────────────────────────── */
-
-static inline uint64_t get_time_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
-
-/* ── Statistics ─────────────────────────────────────────────────────────── */
-
-static int compare_uint64(const void *a, const void *b)
-{
-    uint64_t x = *(const uint64_t *)a;
-    uint64_t y = *(const uint64_t *)b;
-    return (x > y) - (x < y);
-}
-
-static uint64_t pct(const uint64_t *sorted, size_t n, double p)
-{
-    if (n == 0) return 0;
-    size_t idx = (size_t)(p * (double)n);
-    if (idx >= n) idx = n - 1;
-    return sorted[idx];
-}
-
-static void print_metric(const char *label, const uint64_t *samples, size_t n)
-{
-    if (n == 0) {
-        printf("%s: no samples\n", label);
-        return;
+    size_t received = 0;
+    while (received < sizeof(*msg)) {
+        ssize_t r = recv(fd, (char *)msg + received, sizeof(*msg) - received, 0);
+        if (r == 0) return 0;
+        if (r < 0)  return -1;
+        received += (size_t)r;
     }
-
-    static uint64_t sorted[MAX_SAMPLES];
-    memcpy(sorted, samples, n * sizeof(uint64_t));
-    qsort(sorted, n, sizeof(uint64_t), compare_uint64);
-
-    double sum = 0.0;
-    for (size_t i = 0; i < n; i++) sum += (double)samples[i];
-    double mean = sum / (double)n;
-
-    double sq = 0.0;
-    for (size_t i = 0; i < n; i++) {
-        double d = (double)samples[i] - mean;
-        sq += d * d;
-    }
-    double stddev = sqrt(sq / (double)n);
-
-    printf("%s (us):\n", label);
-    printf("  Mean: %8.3f    Std dev: %.3f\n", mean / 1e3, stddev / 1e3);
-    printf("  Min:  %8.3f    Max:     %.3f\n",
-           sorted[0] / 1e3, sorted[n - 1] / 1e3);
-    printf("  P50:  %8.3f    P95:     %.3f\n",
-           pct(sorted, n, 0.50) / 1e3, pct(sorted, n, 0.95) / 1e3);
-    printf("  P99:  %8.3f    P99.9:   %.3f\n",
-           pct(sorted, n, 0.99) / 1e3, pct(sorted, n, 0.999) / 1e3);
+    return (ssize_t)received;
 }
 
-/* ── CSV writer ─────────────────────────────────────────────────────────── */
-
-static void write_csv(const char      *path,
-                      const uint64_t  *seqs,
-                      const uint64_t  *send_ns,
-                      const uint64_t  *recv_ns,
-                      const uint64_t  *owl_ns,
-                      const uint64_t  *iaj_ns,  /* n-1 entries */
-                      size_t           n)
-{
-    FILE *fp = fopen(path, "w");
-    if (!fp) {
-        printf("WARNING: could not open CSV '%s': %s\n", path, strerror(errno));
-        return;
-    }
-    fprintf(fp, "seq,send_time_ns,recv_time_ns,owlatency_us,iat_us\n");
-    for (size_t i = 0; i < n; i++) {
-        fprintf(fp, "%llu,%llu,%llu,%.3f,%.3f\n",
-                (unsigned long long)seqs[i],
-                (unsigned long long)send_ns[i],
-                (unsigned long long)recv_ns[i],
-                (double)owl_ns[i] / 1e3,
-                i > 0 ? (double)iaj_ns[i - 1] / 1e3 : 0.0);
-    }
-    fclose(fp);
-    printf("CSV written to: %s\n", path);
-}
-
-/* ── Main ───────────────────────────────────────────────────────────────── */
+/* ── Main ─────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[])
 {
-    bool        tcp_mode   = false;
-    int         nodelay   = -1;
-    int         fallback_target = 5000;
-    const char *csv_path   = "net_receiver_log.csv";
+    (void)argc; (void)argv;
 
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
-            fallback_target = atoi(argv[++i]);
-        } 
-        else if (strcmp(argv[i], "-t") == 0) {
-            tcp_mode = true;
-        }
-        else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
-            csv_path = argv[++i];
-        } else if (strcmp(argv[i], "-h") == 0 ||
-                   strcmp(argv[i], "--help") == 0) {
-            printf("Usage: %s [options]\n", argv[0]);
-                 printf("  -n <count>   Fallback packets if HELLO target invalid (default: 5000, max: %d)\n",
-                   MAX_SAMPLES);
-            printf("  -t           Use TCP instead of UDP\n");
-            printf("  -o <file>    Output CSV (default: net_receiver_log.csv)\n");
-            printf("  -h           Show this help\n");
-            printf("\nMessage size: %zu B  (NET_PAYLOAD_BYTES=%d)\n",
-                   sizeof(struct net_message), NET_PAYLOAD_BYTES);
-            return 0;
-        }
-    }
+    /* Disable stdout buffering: required on the hi VM safety kernel. */
+    setbuf(stdout, NULL);
 
-    if (fallback_target <= 0 || fallback_target > MAX_SAMPLES) {
-        fprintf(stderr, "ERROR: -n must be between 1 and %d\n", MAX_SAMPLES);
-        return 1;
-    }
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
+        printf("net_receiver_hi: mlockall: %s — continuing\n", strerror(errno));
 
     signal(SIGINT, sigint_handler);
 
     printf("========================================\n");
-    if(tcp_mode) {
-        printf("net_receiver — Scenario 3 (TCP)\n");
-    } else {
-        printf("net_receiver — Scenario 3 (UDP)\n");
-    }
+    printf("net_receiver_hi (echo server) — Scenario 3 reversed\n");
     printf("EB corbos Linux Network Determinism\n");
-    printf("========================================\n");
-    printf("Collecting:   sender-defined target per run\n");
-    printf("Message size: %zu B\n",        sizeof(struct net_message));
-    printf("Recv timeout: %d ms\n\n",      RECV_TIMEOUT_MS);
-
-    /* ── Create receive socket ──────────────────────────────────────────── */
-
-    int sock = socket(AF_INET, tcp_mode ? SOCK_STREAM : SOCK_DGRAM, 0);
-    if (sock < 0) {
-        fprintf(stderr, "ERROR: socket() failed: %s\n", strerror(errno));
-        return 1;
-    }
-
-    /* Apply TCP_NODELAY on the client side as well for ACK timeliness. */
-    if(tcp_mode) {
-        nodelay = 1;
-        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-    }
-
-    /* Larger receive buffer absorbs short bursts without dropping. */
-    int rcvbuf = 1 << 20; /* 1 MB */
-    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-
-    struct sockaddr_in baddr = {0};
-    baddr.sin_family      = AF_INET;
-    baddr.sin_port        = htons(NET_SENDER_PORT);
-    baddr.sin_addr.s_addr = inet_addr(NET_HI_IP);
-
-    if(tcp_mode)
-    {
-        if (connect(sock, (struct sockaddr *)&baddr, sizeof(baddr)) != 0) 
-        {
-            fprintf(stderr, "ERROR: connect() to %s:%d failed: %s\n",
-                NET_HI_IP, NET_SENDER_PORT, strerror(errno));
-            close(sock);
-            return 1;
-        }
-    }
-    else
-    {
-         if (bind(sock, (struct sockaddr *)&baddr, sizeof(baddr)) != 0) {
-            fprintf(stderr, "ERROR: bind(port %d) failed: %s\n",
-                    NET_SENDER_PORT, strerror(errno));
-            return 1;
-        }
-    }
-
-    /* SO_RCVTIMEO applies a receive timeout in case it detects a stalled sender */
-    struct timeval tv = {
-        .tv_sec  = RECV_TIMEOUT_MS / 1000,
-        .tv_usec = (RECV_TIMEOUT_MS % 1000) * 1000,
-    };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    /* Static arrays — declared static so they are pre-faulted and do not
-     * hit the stack limit on vm-li. */
-    static uint64_t owl_ns  [MAX_SAMPLES];
-    static uint64_t iaj_ns  [MAX_SAMPLES]; /* MAX_SAMPLES-1 valid entries */
-    static uint64_t seq_arr [MAX_SAMPLES];
-    static uint64_t send_arr[MAX_SAMPLES];
-    static uint64_t recv_arr[MAX_SAMPLES];
+    printf("RTL mode: echoes probes from vm-li unchanged\n");
+    printf("Msg size: %zu B\n\n", sizeof(struct net_message));
 
     static struct net_message msg;
     static struct net_message ack;
-    uint64_t run_idx = 0;
+    int sock = -1;
+    int run_count = 0;
 
     while (g_running) {
-        struct sockaddr_in peer_addr = {0};
-        socklen_t peer_len = sizeof(peer_addr);
-        int n_target = 0;
 
-        printf("\nWaiting for sender HELLO...\n");
-        while (g_running) {
+        if (sock >= 0) { close(sock); sock = -1; }
+
+        sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0) {
+            printf("net_receiver_hi: ERROR: socket: %s\n", strerror(errno));
+            sleep(1); continue;
+        }
+
+        int reuse = 1;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        int rcvbuf = 1 << 20;
+        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+        struct sockaddr_in baddr = {0};
+        baddr.sin_family      = AF_INET;
+        baddr.sin_port        = htons(NET_SENDER_PORT);
+        baddr.sin_addr.s_addr = inet_addr(NET_HI_IP);
+
+        if (bind(sock, (struct sockaddr *)&baddr, sizeof(baddr)) != 0) {
+            printf("net_receiver_hi: ERROR: bind(%s:%d): %s\n",
+                   NET_HI_IP, NET_SENDER_PORT, strerror(errno));
+            sleep(1); continue;
+        }
+
+        /* Heartbeat timeout while waiting for HELLO. */
+        struct timeval tv_wait = { .tv_sec = 5, .tv_usec = 0 };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv_wait, sizeof(tv_wait));
+
+        printf("\nnet_receiver_hi: waiting for HELLO from pinger (vm-li)...\n");
+
+        struct sockaddr_in li_addr = {0};
+        socklen_t li_len   = sizeof(li_addr);
+        uint64_t  n_probes = 5000;
+        bool      tcp_mode = false;
+        bool      got_hello = false;
+
+        /* ── Wait for HELLO ────────────────────────────────────────────────── */
+
+        while (g_running && !got_hello) {
             ssize_t nb = recvfrom(sock, &msg, sizeof(msg), 0,
-                                  (struct sockaddr *)&peer_addr, &peer_len);
+                                  (struct sockaddr *)&li_addr, &li_len);
             if (nb < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    printf("net_receiver_hi: still waiting for HELLO...\n");
                     continue;
                 }
-                fprintf(stderr, "ERROR: recv() while waiting HELLO failed: %s\n", strerror(errno));
-                close(sock);
-                return 1;
+                printf("net_receiver_hi: ERROR: recvfrom: %s\n", strerror(errno));
+                break;
             }
+            if (nb != (ssize_t)sizeof(msg))    continue;
+            if (msg.seq != NET_CTRL_SEQ_HELLO) continue;
 
-            if (nb != (ssize_t)sizeof(msg)) {
-                continue;
-            }
+            tcp_mode = (msg.payload[0] != 0);
+            memcpy(&n_probes, msg.payload + 1, sizeof(uint64_t));
+            if (n_probes == 0 || n_probes > 100000) n_probes = 5000;
 
-            if (msg.seq != NET_CTRL_SEQ_HELLO) {
-                continue;
-            }
-
-            if (msg.send_time_ns > 0 && msg.send_time_ns <= MAX_SAMPLES) {
-                n_target = (int)msg.send_time_ns;
-            } else {
-                n_target = fallback_target;
-                printf("WARNING: HELLO target %llu invalid, using fallback %d\n",
-                       (unsigned long long)msg.send_time_ns, n_target);
-            }
+            printf("net_receiver_hi: HELLO — protocol=%s  n_probes=%llu\n",
+                   tcp_mode ? "TCP" : "UDP", (unsigned long long)n_probes);
 
             memset(&ack, 0, sizeof(ack));
-            ack.seq = NET_CTRL_SEQ_HELLO_ACK;
-            ack.send_time_ns = (uint64_t)n_target;
+            ack.seq        = NET_CTRL_SEQ_HELLO_ACK;
+            ack.payload[0] = tcp_mode ? 1 : 0;
+
             if (sendto(sock, &ack, sizeof(ack), 0,
-                       (struct sockaddr *)&peer_addr, peer_len) != (ssize_t)sizeof(ack)) {
-                printf("WARNING: failed to send HELLO_ACK: %s\n", strerror(errno));
+                       (struct sockaddr *)&li_addr, li_len) < 0) {
+                printf("net_receiver_hi: WARNING: HELLO_ACK sendto: %s\n",
+                       strerror(errno));
+            } else {
+                printf("net_receiver_hi: HELLO_ACK sent\n");
+            }
+            got_hello = true;
+        }
+
+        if (!g_running || !got_hello) { close(sock); sock = -1; break; }
+
+        /* ── Switch to TCP or prepare UDP echo socket ──────────────────────── */
+
+        int data_sock;
+        if (tcp_mode) {
+            close(sock); sock = -1;
+            int lsock = socket(AF_INET, SOCK_STREAM, 0);
+            if (lsock < 0) {
+                printf("net_receiver_hi: ERROR: TCP socket: %s\n", strerror(errno));
+                break;
+            }
+            setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+            if (bind(lsock, (struct sockaddr *)&baddr, sizeof(baddr)) != 0 ||
+                listen(lsock, 1) != 0) {
+                printf("net_receiver_hi: ERROR: TCP bind/listen: %s\n", strerror(errno));
+                close(lsock);
+                break;
+            }
+            printf("net_receiver_hi: TCP listening — waiting for pinger...\n");
+            struct sockaddr_in cli = {0};
+            socklen_t cli_len = sizeof(cli);
+            data_sock = accept(lsock, (struct sockaddr *)&cli, &cli_len);
+            close(lsock);
+            if (data_sock < 0) {
+                printf("net_receiver_hi: ERROR: TCP accept: %s\n", strerror(errno));
+                break;
+            }
+            int nodelay = 1;
+            setsockopt(data_sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+            printf("net_receiver_hi: TCP connection accepted\n");
+        } else {
+            /* UDP: connect() to pinger so send() works without recvfrom overhead. */
+            struct sockaddr_in dst = li_addr;
+            dst.sin_port = li_addr.sin_port; /* keep pinger's source port */
+            if (connect(sock, (struct sockaddr *)&dst, sizeof(dst)) != 0) {
+                printf("net_receiver_hi: ERROR: UDP connect to pinger: %s\n",
+                       strerror(errno));
                 continue;
             }
-            break;
+            data_sock = sock;
         }
 
-        if (!g_running) {
-            break;
+        /* Echo-phase recv timeout: 3 s — detect end-of-run via silence. */
+        {
+            struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+            setsockopt(data_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         }
 
-        run_idx++;
-        printf("Run %llu started: target=%d packets\n",
-               (unsigned long long)run_idx, n_target);
+        run_count++;
+        printf("net_receiver_hi: run #%d — echoing probes\n", run_count);
 
-        size_t   n_stored     = 0;
-        size_t   n_iaj        = 0;
-        uint64_t n_expected   = 0;
-        uint64_t n_lost       = 0;
-        uint64_t prev_recv_ns = 0;
-        bool     first_pkt    = true;
+        /* ── Echo loop ──────────────────────────────────────────────────────────── */
 
-        while (g_running && n_stored < (size_t)n_target) {
-            ssize_t nb = recvfrom(sock, &msg, sizeof(msg), 0,
-                                  (struct sockaddr *)&peer_addr, &peer_len);
+        uint64_t echoed = 0;
+
+        while (g_running) {
+            ssize_t nb;
+
+            if (tcp_mode) {
+                nb = recv_full(data_sock, &msg);
+                if (nb == 0) {
+                    printf("net_receiver_hi: TCP closed by pinger (%llu echoed)\n",
+                           (unsigned long long)echoed);
+                    break;
+                }
+            } else {
+                nb = recv(data_sock, &msg, sizeof(msg), 0);
+            }
 
             if (nb < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    continue;
+                    printf("net_receiver_hi: run #%d — silence, run ended "
+                           "(%llu echoed)\n",
+                           run_count, (unsigned long long)echoed);
+                    break;
                 }
-                fprintf(stderr, "ERROR: recv() failed: %s\n", strerror(errno));
+                printf("net_receiver_hi: ERROR: recv: %s\n", strerror(errno));
                 break;
             }
 
-            if (nb != (ssize_t)sizeof(msg)) {
-                printf("WARNING: unexpected packet size %zd (expected %zu)\n",
-                       nb, sizeof(msg));
-                continue;
+            if (nb != (ssize_t)sizeof(msg))        continue;
+            if (msg.seq >= NET_CTRL_SEQ_HELLO_ACK) continue;
+
+            /* Echo back immediately — message is NOT modified. */
+            if (send(data_sock, &msg, sizeof(msg), 0) < 0) {
+                printf("net_receiver_hi: WARNING: echo send seq=%llu: %s\n",
+                       (unsigned long long)msg.seq, strerror(errno));
             }
-
-            if (msg.seq == NET_CTRL_SEQ_HELLO) {
-                memset(&ack, 0, sizeof(ack));
-                ack.seq = NET_CTRL_SEQ_HELLO_ACK;
-                ack.send_time_ns = (uint64_t)n_target;
-                sendto(sock, &ack, sizeof(ack), 0,
-                       (struct sockaddr *)&peer_addr, peer_len);
-                continue;
-            }
-
-            if (msg.seq == NET_CTRL_SEQ_HELLO_ACK) {
-                continue;
-            }
-
-            uint64_t recv_ns = get_time_ns();
-
-            if (!first_pkt && msg.seq > n_expected) {
-                uint64_t gap = msg.seq - n_expected;
-                printf("WARNING: seq gap — expected %llu got %llu (%llu packet(s) lost)\n",
-                       (unsigned long long)n_expected,
-                       (unsigned long long)msg.seq,
-                       (unsigned long long)gap);
-                n_lost += gap;
-            }
-            n_expected = msg.seq + 1;
-            first_pkt = false;
-
-            uint64_t owl = (recv_ns >= msg.send_time_ns)
-                           ? (recv_ns - msg.send_time_ns)
-                           : 0;
-
-            if (prev_recv_ns != 0 && n_iaj < MAX_SAMPLES) {
-                uint64_t iat = recv_ns - prev_recv_ns;
-                int64_t dev = (int64_t)iat - (int64_t)SENDER_PERIOD_NS;
-                iaj_ns[n_iaj++] = (uint64_t)(dev < 0 ? -dev : dev);
-            }
-            prev_recv_ns = recv_ns;
-
-            owl_ns[n_stored] = owl;
-            seq_arr[n_stored] = msg.seq;
-            send_arr[n_stored] = msg.send_time_ns;
-            recv_arr[n_stored] = recv_ns;
-            n_stored++;
-
-            if (n_stored % 1000 == 0) {
-                printf("Run %llu progress: %zu/%d (lost=%llu)\n",
-                       (unsigned long long)run_idx,
-                       n_stored,
-                       n_target,
-                       (unsigned long long)n_lost);
-            }
+            echoed++;
         }
 
-        {
-            uint64_t n_sent_total = n_stored + n_lost;
+        printf("net_receiver_hi: run #%d complete — %llu probes echoed\n",
+               run_count, (unsigned long long)echoed);
 
-            printf("\n========== NET RECEIVER RESULTS (run %llu) ==========\n",
-                   (unsigned long long)run_idx);
-            printf("Packets expected:  %5llu\n", (unsigned long long)n_sent_total);
-            printf("Packets received:  %5zu\n",  n_stored);
-            printf("Packets lost:      %5llu (%.3f%%)\n",
-                   (unsigned long long)n_lost,
-                   n_sent_total > 0 ? (double)n_lost / (double)n_sent_total * 100.0 : 0.0);
+        if (tcp_mode) { close(data_sock); }
+        else          { close(sock); sock = -1; }
 
-            print_metric("OWL", owl_ns, n_stored);
-            print_metric("IAJ", iaj_ns, n_iaj);
-            printf("==========================================\n");
-        }
-
-        write_csv(csv_path, seq_arr, send_arr, recv_arr, owl_ns, iaj_ns, n_stored);
-
-        if (g_running) {
-            printf("Receiver returning to wait state for next run...\n");
-        }
+        if (g_running)
+            printf("net_receiver_hi: returning to wait state...\n");
     }
 
-    close(sock);
+    if (sock >= 0) close(sock);
+    printf("net_receiver_hi: terminated\n");
+
+    if (getpid() == 1) {
+        printf("net_receiver_hi: PID 1 — entering idle loop\n");
+        while (1) sleep(3600);
+    }
     return 0;
 }

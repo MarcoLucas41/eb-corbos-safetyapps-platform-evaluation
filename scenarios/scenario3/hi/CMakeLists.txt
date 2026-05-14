@@ -28,25 +28,6 @@ endfunction()
 # # Install to / so the hi VM kernel boot parameter init=/net_sender finds it.
 # install(TARGETS net_sender DESTINATION /)
 
-# ── TCP variant ──────────────────────────────────────────────────────────────
-
-add_executable(net_sender_tcp net_sender_tcp.c)
-
-target_include_directories(net_sender_tcp PRIVATE
-   ${CMAKE_CURRENT_SOURCE_DIR}/../common
-)
-
-target_compile_definitions(net_sender_tcp PRIVATE
-  NET_PAYLOAD_BYTES=${NET_PAYLOAD_BYTES}
-)
-
-target_link_libraries(net_sender_tcp PRIVATE rt)
-
-target_enable_hi(net_sender_tcp)
-
-# Install to / so the hi VM can use init=/net_sender_tcp.
-install(TARGETS net_sender_tcp DESTINATION /)
-
 # ── net_receiver in hi ──────────────────────────────────────────────────────────────
 
 # add_executable(hi_net_receiver hi_net_receiver.c)
