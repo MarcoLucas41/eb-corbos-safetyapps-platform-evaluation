@@ -1,4 +1,4 @@
-# Scenario 3: Network Communication Determinism — Experiment Design
+# Scenario 3: Network Channel — Experiment Design
 
 ---
 
@@ -10,9 +10,9 @@ The three scenarios cover three distinct communication layers of the same platfo
 
 | Scenario | Property tested           | Layer                               |
 |----------|---------------------------|-------------------------------------|
-| 1        | Freedom from interference | Intra-VM: task timing isolation     |
-| 2        | Inter-VM channel quality  | Hypervisor: shared memory latency   |
-| 3        | Network determinism       | Hypervisor: virtual Ethernet latency|
+| 1        | Task Isolation 		| Intra-VM: task timing isolation     |
+| 2        | Shared Memory Channels  | Hypervisor: shared memory latency   |
+| 3        | Network channel       | Hypervisor: virtual Ethernet latency|
 
 Scenario 2 characterises the *shared memory* channels (`hv_proxycomshm` and `hv_hicomshm`).
 Scenario 3 characterises the *virtual Ethernet* channel exposed through the hypervisor's

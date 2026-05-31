@@ -122,7 +122,6 @@ int main(int argc, char *argv[])
                                   (struct sockaddr *)&ping_addr, &ping_len);
             if (nb < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    printf("[echo] still waiting for HELLO...\n");
                     continue;
                 }
                 printf("[echo] ERROR: recvfrom: %s\n", strerror(errno));
@@ -185,13 +184,10 @@ int main(int argc, char *argv[])
             setsockopt(data_sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
             printf("[echo] TCP connection accepted (TCP_NODELAY set)\n");
         } else {
-            /* UDP: connect() so send() targets hi_net_ping directly. */
-            if (connect(sock, (struct sockaddr *)&ping_addr, ping_len) != 0) {
-                printf("[echo] ERROR: UDP connect to pinger: %s\n",
-                       strerror(errno));
-                close(sock);
-                continue;
-            }
+            /* UDP: stay unconnected and reply to the sender of each probe.
+             * hi_net_ping uses a separate HELLO socket and a separate data
+             * socket, so connecting to the HELLO source port would send echoes
+             * to the wrong endpoint. */
             data_sock = sock;
         }
 
@@ -210,6 +206,8 @@ int main(int argc, char *argv[])
 
         while (g_running) {
             ssize_t nb;
+            struct sockaddr_in peer_addr = {0};
+            socklen_t peer_len = sizeof(peer_addr);
 
             if (tcp_mode) {
                 nb = recv_full(data_sock, &msg);
@@ -219,7 +217,8 @@ int main(int argc, char *argv[])
                     break;
                 }
             } else {
-                nb = recv(data_sock, &msg, sizeof(msg), 0);
+                nb = recvfrom(data_sock, &msg, sizeof(msg), 0,
+                              (struct sockaddr *)&peer_addr, &peer_len);
             }
 
             if (nb < 0) {
@@ -236,7 +235,13 @@ int main(int argc, char *argv[])
             if (msg.seq >= NET_CTRL_SEQ_HELLO_ACK) continue; /* skip ctrl pkts */
 
             /* Echo back immediately — message is NOT modified. */
-            if (send(data_sock, &msg, sizeof(msg), 0) < 0) {
+            if (tcp_mode) {
+                if (send(data_sock, &msg, sizeof(msg), 0) < 0) {
+                    printf("[echo] WARNING: echo send seq=%llu: %s\n",
+                           (unsigned long long)msg.seq, strerror(errno));
+                }
+            } else if (sendto(data_sock, &msg, sizeof(msg), 0,
+                               (struct sockaddr *)&peer_addr, peer_len) < 0) {
                 printf("[echo] WARNING: echo send seq=%llu: %s\n",
                        (unsigned long long)msg.seq, strerror(errno));
             }
