@@ -17,7 +17,7 @@ set(PING_PAYLOAD_BYTES "48" CACHE STRING "Ping message payload size in bytes")
 add_compile_options(-Wall -Wextra -Werror)
 
 # Reuse the shmlib from scenario1 — no duplication.
-add_subdirectory(../scenario1/shmlib shmlib_build)
+add_subdirectory(../ebclfsa-demo/shmlib shmlib_build)
 
 find_package(Threads REQUIRED)
 
