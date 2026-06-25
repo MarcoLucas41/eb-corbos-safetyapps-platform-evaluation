@@ -1,12 +1,12 @@
 /*
- * net_receiver_hi.c — Scenario 3 reversed variant: echo server (vm-hi)
+ * net_echo.c — Scenario 3 reversed variant: echo server (vm-hi)
  *
  * Runs as PID 1 on vm-hi.  Implements a ping-echo server:
  *   - Waits for HELLO from the pinger on vm-li.
  *   - Negotiates UDP/TCP transport via the handshake.
  *   - Echoes every received probe back to vm-li unchanged.
  *
- * vm-li measures Round-Trip Latency (RTL) on its own clock.
+ * vm-li measures Round-Trip Time (RTT) on its own clock.
  * No OWL computation or clock calibration is performed here.
  *
  * Run lifecycle (supports multiple runs per QEMU boot):
@@ -64,14 +64,13 @@ int main(int argc, char *argv[])
     setbuf(stdout, NULL);
 
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
-        printf("net_receiver_hi: mlockall: %s — continuing\n", strerror(errno));
+        printf("net_echo: mlockall: %s — continuing\n", strerror(errno));
 
     signal(SIGINT, sigint_handler);
 
     printf("========================================\n");
-    printf("net_receiver_hi (echo server) — Scenario 3 reversed\n");
-    printf("EB corbos Linux Network Determinism\n");
-    printf("RTL mode: echoes probes from vm-li unchanged\n");
+    printf("net_echo (echo server) — Scenario 3\n");
+    printf("EB corbos Linux \n");
     printf("Msg size: %zu B\n\n", sizeof(struct net_message));
 
     static struct net_message msg;
@@ -85,7 +84,7 @@ int main(int argc, char *argv[])
 
         sock = socket(AF_INET, SOCK_DGRAM, 0);
         if (sock < 0) {
-            printf("net_receiver_hi: ERROR: socket: %s\n", strerror(errno));
+            printf("net_echo: ERROR: socket: %s\n", strerror(errno));
             sleep(1); continue;
         }
 
@@ -100,7 +99,7 @@ int main(int argc, char *argv[])
         baddr.sin_addr.s_addr = inet_addr(NET_HI_IP);
 
         if (bind(sock, (struct sockaddr *)&baddr, sizeof(baddr)) != 0) {
-            printf("net_receiver_hi: ERROR: bind(%s:%d): %s\n",
+            printf("net_echo: ERROR: bind(%s:%d): %s\n",
                    NET_HI_IP, NET_SENDER_PORT, strerror(errno));
             sleep(1); continue;
         }
@@ -109,7 +108,7 @@ int main(int argc, char *argv[])
         struct timeval tv_wait = { .tv_sec = 5, .tv_usec = 0 };
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv_wait, sizeof(tv_wait));
 
-        printf("\nnet_receiver_hi: waiting for HELLO from pinger (vm-li)...\n");
+        printf("\nnet_echo: waiting for HELLO from pinger (vm-li)...\n");
 
         struct sockaddr_in li_addr = {0};
         socklen_t li_len   = sizeof(li_addr);
@@ -124,10 +123,10 @@ int main(int argc, char *argv[])
                                   (struct sockaddr *)&li_addr, &li_len);
             if (nb < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    printf("net_receiver_hi: still waiting for HELLO...\n");
+                    // printf("net_echo: still waiting for HELLO...\n");
                     continue;
                 }
-                printf("net_receiver_hi: ERROR: recvfrom: %s\n", strerror(errno));
+                printf("net_echo: ERROR: recvfrom: %s\n", strerror(errno));
                 break;
             }
             if (nb != (ssize_t)sizeof(msg))    continue;
@@ -137,7 +136,7 @@ int main(int argc, char *argv[])
             memcpy(&n_probes, msg.payload + 1, sizeof(uint64_t));
             if (n_probes == 0 || n_probes > 100000) n_probes = 5000;
 
-            printf("net_receiver_hi: HELLO — protocol=%s  n_probes=%llu\n",
+            printf("net_echo: HELLO — protocol=%s  n_probes=%llu\n",
                    tcp_mode ? "TCP" : "UDP", (unsigned long long)n_probes);
 
             memset(&ack, 0, sizeof(ack));
@@ -146,10 +145,10 @@ int main(int argc, char *argv[])
 
             if (sendto(sock, &ack, sizeof(ack), 0,
                        (struct sockaddr *)&li_addr, li_len) < 0) {
-                printf("net_receiver_hi: WARNING: HELLO_ACK sendto: %s\n",
+                printf("net_echo: WARNING: HELLO_ACK sendto: %s\n",
                        strerror(errno));
             } else {
-                printf("net_receiver_hi: HELLO_ACK sent\n");
+                printf("net_echo: HELLO_ACK sent\n");
             }
             got_hello = true;
         }
@@ -163,34 +162,34 @@ int main(int argc, char *argv[])
             close(sock); sock = -1;
             int lsock = socket(AF_INET, SOCK_STREAM, 0);
             if (lsock < 0) {
-                printf("net_receiver_hi: ERROR: TCP socket: %s\n", strerror(errno));
+                printf("net_echo: ERROR: TCP socket: %s\n", strerror(errno));
                 break;
             }
             setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
             if (bind(lsock, (struct sockaddr *)&baddr, sizeof(baddr)) != 0 ||
                 listen(lsock, 1) != 0) {
-                printf("net_receiver_hi: ERROR: TCP bind/listen: %s\n", strerror(errno));
+                printf("net_echo: ERROR: TCP bind/listen: %s\n", strerror(errno));
                 close(lsock);
                 break;
             }
-            printf("net_receiver_hi: TCP listening — waiting for pinger...\n");
+            printf("net_echo: TCP listening — waiting for pinger...\n");
             struct sockaddr_in cli = {0};
             socklen_t cli_len = sizeof(cli);
             data_sock = accept(lsock, (struct sockaddr *)&cli, &cli_len);
             close(lsock);
             if (data_sock < 0) {
-                printf("net_receiver_hi: ERROR: TCP accept: %s\n", strerror(errno));
+                printf("net_echo: ERROR: TCP accept: %s\n", strerror(errno));
                 break;
             }
             int nodelay = 1;
             setsockopt(data_sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-            printf("net_receiver_hi: TCP connection accepted\n");
+            printf("net_echo: TCP connection accepted\n");
         } else {
             /* UDP: connect() to pinger so send() works without recvfrom overhead. */
             struct sockaddr_in dst = li_addr;
             dst.sin_port = li_addr.sin_port; /* keep pinger's source port */
             if (connect(sock, (struct sockaddr *)&dst, sizeof(dst)) != 0) {
-                printf("net_receiver_hi: ERROR: UDP connect to pinger: %s\n",
+                printf("net_echo: ERROR: UDP connect to pinger: %s\n",
                        strerror(errno));
                 continue;
             }
@@ -204,7 +203,7 @@ int main(int argc, char *argv[])
         }
 
         run_count++;
-        printf("net_receiver_hi: run #%d — echoing probes\n", run_count);
+        printf("net_echo: run #%d — echoing probes\n", run_count);
 
         /* ── Echo loop ──────────────────────────────────────────────────────────── */
 
@@ -216,7 +215,7 @@ int main(int argc, char *argv[])
             if (tcp_mode) {
                 nb = recv_full(data_sock, &msg);
                 if (nb == 0) {
-                    printf("net_receiver_hi: TCP closed by pinger (%llu echoed)\n",
+                    printf("net_echo: TCP closed by pinger (%llu echoed)\n",
                            (unsigned long long)echoed);
                     break;
                 }
@@ -226,12 +225,12 @@ int main(int argc, char *argv[])
 
             if (nb < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    printf("net_receiver_hi: run #%d — silence, run ended "
+                    printf("net_echo: run #%d — silence, run ended "
                            "(%llu echoed)\n",
                            run_count, (unsigned long long)echoed);
                     break;
                 }
-                printf("net_receiver_hi: ERROR: recv: %s\n", strerror(errno));
+                printf("net_echo: ERROR: recv: %s\n", strerror(errno));
                 break;
             }
 
@@ -240,27 +239,27 @@ int main(int argc, char *argv[])
 
             /* Echo back immediately — message is NOT modified. */
             if (send(data_sock, &msg, sizeof(msg), 0) < 0) {
-                printf("net_receiver_hi: WARNING: echo send seq=%llu: %s\n",
+                printf("net_echo: WARNING: echo send seq=%llu: %s\n",
                        (unsigned long long)msg.seq, strerror(errno));
             }
             echoed++;
         }
 
-        printf("net_receiver_hi: run #%d complete — %llu probes echoed\n",
+        printf("net_echo: run #%d complete — %llu probes echoed\n",
                run_count, (unsigned long long)echoed);
 
         if (tcp_mode) { close(data_sock); }
         else          { close(sock); sock = -1; }
 
         if (g_running)
-            printf("net_receiver_hi: returning to wait state...\n");
+            printf("net_echo: returning to wait state...\n");
     }
 
     if (sock >= 0) close(sock);
-    printf("net_receiver_hi: terminated\n");
+    printf("net_echo: terminated\n");
 
     if (getpid() == 1) {
-        printf("net_receiver_hi: PID 1 — entering idle loop\n");
+        printf("net_echo: PID 1 — entering idle loop\n");
         while (1) sleep(3600);
     }
     return 0;

@@ -107,8 +107,6 @@ int main(int argc, char *argv[])
         struct timeval tv_wait = { .tv_sec = 5, .tv_usec = 0 };
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv_wait, sizeof(tv_wait));
 
-        printf("[echo] waiting for HELLO from hi_net_ping...\n");
-
         struct sockaddr_in ping_addr = {0};
         socklen_t ping_len   = sizeof(ping_addr);
         uint64_t  n_probes   = 5000;
@@ -223,8 +221,8 @@ int main(int argc, char *argv[])
 
             if (nb < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    printf("[echo] run #%d — silence, run ended (%llu echoed)\n",
-                           run_count, (unsigned long long)echoed);
+                    // printf("[echo] run #%d — silence, run ended (%llu echoed)\n",
+                    //        run_count, (unsigned long long)echoed);
                     break;
                 }
                 printf("[echo] ERROR: recv: %s\n", strerror(errno));
@@ -248,12 +246,11 @@ int main(int argc, char *argv[])
             echoed++;
         }
 
-        printf("[echo] run #%d complete — %llu probes echoed\n",
-               run_count, (unsigned long long)echoed);
+        // printf("[echo] run #%d complete — %llu probes echoed\n",
+        //        run_count, (unsigned long long)echoed);
         close(data_sock);
 
-        if (g_running)
-            printf("[echo] returning to wait state...\n");
+     
     }
 
     printf("[echo] terminated\n");

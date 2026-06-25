@@ -2,8 +2,11 @@
 #
 # Scenario 3 Experiment Orchestrator — Network Communication Determinism
 #
-# Runs 6 primary conditions (C0–C5, flood N = 0/16/32/64/128/256 Mbps)
-# and 4 secondary netem conditions (D1/D2/L1/L2), via SSH into vm-li.
+# Runs experiments based on a matrix:
+# Stressor types: baseline, cpu, cache, stream, io, worst-case
+# Number of workers: 0 (baseline), 4, 8, 16, 32, 64
+
+
 # QEMU is rebooted between conditions for a clean state.
 #
 # Before each condition the script:
@@ -12,12 +15,12 @@
 #   3. Optionally applies a tc netem rule (secondary conditions).
 #
 # Usage:
-#   ./experiments/run_scenario3.sh                      # all conditions
-#   ./experiments/run_scenario3.sh -n 5                 # 5 runs per condition
-#   ./experiments/run_scenario3.sh -m 1000              # 1000 packets per run
-#   ./experiments/run_scenario3.sh -c C0_baseline       # single condition
-#   ./experiments/run_scenario3.sh -c D1_delay_1ms      # single netem condition
-#
+#   ./experiments/s3_orchestrator.sh                      # all conditions
+#   ./experiments/s3_orchestrator.sh -t                   # use TCP protocol (UDP by default)
+#   ./experiments/s3_orchestrator.sh -n 5                 # 5 runs per condition
+#   ./experiments/s3_orchestrator.sh -m 1000              # 1000 packets per run
+#   ./experiments/s3_orchestrator.sh -c C0_baseline       # single condition
+#   ./experiments/s3_orchestrator.sh -b                   # run with hicom variant settings
 
 set -o pipefail
 
@@ -25,158 +28,168 @@ set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../../../images/arm64/qemu/ebclfsa" && pwd)"
-RESULTS_DIR="$SCRIPT_DIR/results_udp/$(date +%Y-%m-%d_%H:%M:%S)"
 
-RUNS_PER_CONDITION=10
-PACKETS_PER_RUN=10000
-SINGLE_CONDITION=""
+# Results root is chosen after parsing args so -b and -t can switch it
+RESULTS_UDP_ROOT="$SCRIPT_DIR/results_udp" # no -b and -t
+RESULTS_TCP_ROOT="$SCRIPT_DIR/results_tcp" # -t 
+RESULTS_HICOM_UDP_ROOT="$SCRIPT_DIR/results_hicom_udp" # -b
+RESULTS_HICOM_TCP_ROOT="$SCRIPT_DIR/results_hicom_tcp" # -b and -t
+
+RUNS_PER_EXPERIMENT=30
+PACKETS_PER_RUN=2000
+SINGLE_STRESSOR=""
+HICOM_MODE=0
+TCP_MODE=0
+
+# Marker strings from shm_ping_hi console output
+READY_MARKER="HI_NET_PING_READY"
+DONE_MARKER_PREFIX="HI_NET_PING_DONE run="
+READY_TIMEOUT=60   # seconds to wait for HI_NET_PING_READY after boot
+
+CLIENT_BIN="net_client"
 
 SSH_PORT=2222
 SSH_USER="root"
 SSH_HOST="localhost"
 SSH_PASS="linux"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
-TSHARK_AVAILABLE=""
 
 BOOT_MARKER="Ubuntu 22.04 LTS ebclfsa-li hvc0"
-BOOT_TIMEOUT=180
-SSH_TIMEOUT=120
+BOOT_TIMEOUT=60
+SSH_TIMEOUT=60
 
 # IP assigned to the vnet_li_hi interface on vm-li for this scenario.
 VNET_LI_IP="10.0.1.2"
 VNET_NETMASK="24"
 
-# ─── Primary Condition Definitions ───────────────────────────────────────────
-# Each condition passes -B <Mbps> to net_receiver; C0 passes nothing (baseline).
+STRESSOR_TYPES=(worst-case)
+NUM_WORKERS_LIST=(n8)
 
-PRIMARY_NAMES=(
-    "C0_baseline"
-    "C1_16mbps"
-    "C2_32mbps"
-    "C3_64mbps"
-    "C4_128mbps"
-    "C5_256mbps"
-)
+declare -A NUM_WORKERS_MAP=([n2]=2 [n4]=4 [n8]=8)
 
-declare -A PRIMARY_FLOOD_MBPS
-PRIMARY_FLOOD_MBPS[C0_baseline]="0"
-PRIMARY_FLOOD_MBPS[C1_16mbps]="16"
-PRIMARY_FLOOD_MBPS[C2_32mbps]="32"
-PRIMARY_FLOOD_MBPS[C3_64mbps]="64"
-PRIMARY_FLOOD_MBPS[C4_128mbps]="128"
-PRIMARY_FLOOD_MBPS[C5_256mbps]="256"
+# Condition-level mappings (populated below)
+declare -A STRESSOR_WORKERS
+declare -A STRESSOR_LABELS
 
-declare -A PRIMARY_LABELS
-PRIMARY_LABELS[C0_baseline]="N=0 Mbps (baseline)"
-PRIMARY_LABELS[C1_16mbps]="N=16 Mbps"
-PRIMARY_LABELS[C2_32mbps]="N=32 Mbps"
-PRIMARY_LABELS[C3_64mbps]="N=64 Mbps"
-PRIMARY_LABELS[C4_128mbps]="N=128 Mbps"
-PRIMARY_LABELS[C5_256mbps]="N=256 Mbps"
+normalize_QEMU_serial_output() {
+    local to_csv="${1:-0}"
+    awk -v TO_CSV="$to_csv" '
+    function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+    {
+        line = $0
+        gsub(/\r/, "", line)
 
-# ─── Secondary (netem) Condition Definitions ─────────────────────────────────
-# Runs with N=0 flood; a tc netem rule is applied on the vnet_li_hi interface.
+        # Strip ANSI colors/sequences
+        gsub(/\033\[[0-9;]*[[:alpha:]]/, "", line)
 
-NETEM_NAMES=(
-    "D1_delay_1ms"
-    "D2_delay_5ms_jitter"
-    "L1_loss_0p5"
-    "L2_loss_2p0"
-)
+        # Strip QEMU serial prefixes
+        sub(/^[[:space:]]*vm-hi[[:space:]]*\|[[:space:]]*/, "", line)
+        sub(/^[[:space:]]*vm-hi,\|,/, "", line)
 
-declare -A NETEM_PARAMS
-NETEM_PARAMS[D1_delay_1ms]="delay 1ms"
-NETEM_PARAMS[D2_delay_5ms_jitter]="delay 5ms 1ms distribution normal"
-NETEM_PARAMS[L1_loss_0p5]="loss 0.5%"
-NETEM_PARAMS[L2_loss_2p0]="loss 2%"
+        # Strip kernel log prefixes like "[  552.333704] random: crng init"
+        sub(/^\[[[:space:]]*[0-9.]+\][^,]*/, "", line)
 
-declare -A NETEM_LABELS
-NETEM_LABELS[D1_delay_1ms]="delay 10000ms"
-NETEM_LABELS[D2_delay_5ms_jitter]="delay 20ms 10ms"
-NETEM_LABELS[L1_loss_0p5]="loss 20%"
-NETEM_LABELS[L2_loss_2p0]="loss random 99%"
+        line = trim(line)
+        if (line == "") next
 
-NETEM_RUNS=5      # fewer runs for the secondary block
-NETEM_PACKETS=1000
+        if (TO_CSV == 1 && line !~ /,/) {
+            gsub(/[[:space:]]+/, ",", line)
+        }
+
+        # Remove trailing commas
+        sub(/,+$/, "", line)
+
+        if (line != "") print line
+    }'
+}
+
+fix_QEMU_serial_log_format() {
+    normalize_QEMU_serial_output 0
+}
+
+normalize_vmstat_to_csv() {
+    normalize_QEMU_serial_output 1
+}
+
+build_conditions() {
+    local -n out_conditions=$1
+    out_conditions=()
+
+    for stressor in "${STRESSOR_TYPES[@]}"; do
+        if [[ "$stressor" == "baseline" ]]; then
+            local name="baseline"
+            STRESSOR_WORKERS["$name"]=0
+            out_conditions+=("$name")
+            continue
+        fi
+
+        for worker_key in "${NUM_WORKERS_LIST[@]}"; do
+            local name="${stressor}_${worker_key}"
+            STRESSOR_WORKERS["$name"]="${NUM_WORKERS_MAP[$worker_key]}"
+            STRESSOR_LABELS["$name"]="${stressor}"
+            out_conditions+=("$name")
+        done
+    done
+}
+
+filter_conditions() {
+    local -n in_conditions=$1
+    local -n out_conditions=$2
+    local selected_stressor=$3
+
+    out_conditions=()
+    if [[ -z "$selected_stressor" ]]; then
+        out_conditions=("${in_conditions[@]}")
+        return 0
+    fi
+
+    for condition in "${in_conditions[@]}"; do
+        if [[ "$condition" == "$selected_stressor"* ]]; then
+            out_conditions+=("$condition")
+        fi
+    done
+}
 
 # ─── Argument Parsing ────────────────────────────────────────────────────────
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -n|--runs)       RUNS_PER_CONDITION="$2"; shift 2 ;;
-        -m|--messages)   PACKETS_PER_RUN="$2";    shift 2 ;;
-        -c|--condition)  SINGLE_CONDITION="$2";    shift 2 ;;
+        -n|--runs)       RUNS_PER_EXPERIMENT="$2"; shift 2 ;;
+        -p|--packets)    PACKETS_PER_RUN="$2";    shift 2 ;;
+        -s|--condition)  SINGLE_STRESSOR="$2";    shift 2 ;;
+        -b|--hicom)      HICOM_MODE=1; CLIENT_BIN="net_trigger"; shift 1 ;;
+        -t|--tcp)        TCP_MODE=1; shift 1 ;;
         -h|--help)
             echo "Usage: $0 [options]"
-            echo "  -n, --runs <N>          Runs per condition (default: 10)"
-            echo "  -m, --messages <N>      Packets per run (default: 5000)"
-            echo "  -c, --condition <name>  Run only this condition"
+            echo "  -n, --runs <N>          Runs per experiment (default: 10)"
+            echo "  -p, --packets <N>       Packets per run (default: 2000)"
+            echo "  -s, --stressor <name>   Run only this stressor"
             echo "  -h, --help              Show this help"
             echo ""
-            echo "Primary conditions:  ${PRIMARY_NAMES[*]}"
-            echo "Netem conditions:    ${NETEM_NAMES[*]}"
+            echo "Primary conditions:  ${STRESSOR_TYPES[*]}"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
+# Choose results dir based on mode
+
+if [[ $HICOM_MODE -eq 1 && $TCP_MODE -eq 1 ]]; then
+    RESULTS_DIR="$RESULTS_HICOM_TCP_ROOT/$(date +%Y-%m-%d_%H:%M:%S)"
+elif [[ $HICOM_MODE -eq 1 ]]; then
+    RESULTS_DIR="$RESULTS_HICOM_UDP_ROOT/$(date +%Y-%m-%d_%H:%M:%S)"
+elif [[ $TCP_MODE -eq 1 ]]; then
+    RESULTS_DIR="$RESULTS_TCP_ROOT/$(date +%Y-%m-%d_%H:%M:%S)"
+else
+    RESULTS_DIR="$RESULTS_UDP_ROOT/$(date +%Y-%m-%d_%H:%M:%S)"
+fi
+
+
 # ─── SSH Helper ───────────────────────────────────────────────────────────────
 
 run_ssh() {
     sshpass -p "$SSH_PASS" ssh $SSH_OPTS -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "$@"
-}
-
-# ─── Remote tshark helpers ───────────────────────────────────────────────────
-
-detect_remote_tshark() {
-    if [[ -n "$TSHARK_AVAILABLE" ]]; then
-        return
-    fi
-
-    if run_ssh "command -v tshark >/dev/null 2>&1"; then
-        TSHARK_AVAILABLE="1"
-        echo "Remote tshark is available."
-    else
-        TSHARK_AVAILABLE="0"
-        echo "WARNING: tshark not found in VM; packet capture logs will be skipped."
-    fi
-}
-
-start_tshark_capture() {
-    local iface="$1"
-    local remote_file="$2"
-
-    if [[ "$TSHARK_AVAILABLE" != "1" ]]; then
-        echo ""
-        return 0
-    fi
-
-    run_ssh "rm -f '$remote_file'; nohup tshark -i '$iface' -n -l > '$remote_file' 2>&1 < /dev/null & echo \$!" 2>/dev/null | tr -d '\r\n'
-}
-
-stop_tshark_capture() {
-    local pid="$1"
-
-    if [[ "$TSHARK_AVAILABLE" != "1" || -z "$pid" ]]; then
-        return 0
-    fi
-
-    # SIGINT gives tshark a chance to flush output before we collect the log.
-    run_ssh "kill -2 '$pid' 2>/dev/null || true" >/dev/null 2>&1 || true
-    sleep 1
-}
-
-save_tshark_capture() {
-    local remote_file="$1"
-    local local_file="$2"
-
-    if [[ "$TSHARK_AVAILABLE" != "1" ]]; then
-        return 0
-    fi
-
-    run_ssh "cat '$remote_file' 2>/dev/null || true" > "$local_file"
-    run_ssh "rm -f '$remote_file'" >/dev/null 2>&1 || true
 }
 
 # ─── QEMU Lifecycle ───────────────────────────────────────────────────────────
@@ -202,7 +215,7 @@ wait_for_boot() {
             echo "Boot marker detected after ${elapsed}s."
             return 0
         fi
-        sleep 5; elapsed=$((elapsed + 5))
+        sleep 15; elapsed=$((elapsed + 15))
         if ! pgrep -f qemu-system-aarch64 &>/dev/null; then
             echo "ERROR: QEMU process died. Check $log_file."
             return 1
@@ -236,6 +249,55 @@ stop_qemu() {
     pkill -9 -f qemu-system-aarch64 2>/dev/null
     QEMU_PID=""
     echo "QEMU stopped."
+}
+# Wait for hi_net_ping to finish initialising and print HI_NET_PING_READY.
+wait_for_hi_ready() {
+    local log_file="$1"
+    echo "Waiting for HI_NET_PING_READY in hi console (timeout: ${READY_TIMEOUT}s)..."
+    local elapsed=0
+    while [[ $elapsed -lt $READY_TIMEOUT ]]; do
+        if grep -q "$READY_MARKER" "$log_file" 2>/dev/null; then
+            echo "hi_net_ping is ready."
+            return 0
+        fi
+        sleep 2; elapsed=$((elapsed + 2))
+    done
+    echo "ERROR: HI_NET_PING_READY not seen after ${READY_TIMEOUT}s."
+    return 1
+}
+# Wait for "HI_NET_PING_DONE run=<run_idx>" to appear in the console log.
+wait_for_hi_done() {
+    local log_file="$1"
+    local run_idx="$2"
+    local marker="${DONE_MARKER_PREFIX}${run_idx}"
+    local timeout=300   # a 1000-ping run takes at most ~5 min at slow poll
+    local elapsed=0
+    while [[ $elapsed -lt $timeout ]]; do
+        if grep -q "$marker" "$log_file" 2>/dev/null; then
+            return 0
+        fi
+        sleep 2; elapsed=$((elapsed + 2))
+    done
+    echo "ERROR: '${marker}' not seen after ${timeout}s."
+    return 1
+}
+
+extract_run_results() {
+    local log_file="$1"
+    local run_idx="$2"
+    local dest_file="$3"
+    local cycles_file="$4"
+    awk \
+        "/HI_NET_PING_START run=${run_idx}/{found=1} \
+         found{print} \
+         /HI_NET_PING_DONE run=${run_idx}/{found=0}" \
+        "$log_file" | fix_QEMU_serial_log_format > "$dest_file"
+     awk \
+        "/===CSV_START===/{in_csv=1; next} \
+         /===CSV_END===/{in_csv=0} \
+         in_csv{print}" \
+        "$dest_file" > "$cycles_file"
+
 }
 
 trap stop_qemu EXIT
@@ -272,45 +334,33 @@ configure_vnet_iface() {
     if run_ssh "ping -c 1 -W 2 10.0.1.1" &>/dev/null; then
         echo "Reachability check: vm-hi (10.0.1.1) is reachable via $iface."
     else
-        echo "WARNING: vm-hi (10.0.1.1) not reachable — net_sender may not be up yet."
+        echo "WARNING: vm-hi (10.0.1.1) not reachable — net_client may not be up yet."
     fi
 
     echo "$iface"   # return value
 }
 
-# ─── Apply / Remove netem ─────────────────────────────────────────────────────
+# ─── Run a given stressor type with a given number of workers ──────────────────────────────────────────────────
 
-apply_netem() {
-    local iface="$1"
-    local params="$2"
-    echo "Running command: tc qdisc add dev '$iface' root netem $params"
-    # run_ssh "tc qdisc add dev '$iface' root netem $params" 2>/dev/null || \
-    #     echo "WARNING: tc netem apply failed (iproute2 may not be installed)"
-    run_ssh "tc qdisc add dev eth0 root netem $params" 2>/dev/null || \
-        echo "WARNING: tc netem apply failed (iproute2 may not be installed)"
-}
+run_experiment() {
 
-remove_netem() {
-    local iface="$1"
-    run_ssh "tc qdisc del dev '$iface' root 2>/dev/null || true"
-}
-
-# ─── Run a Single Primary Condition ──────────────────────────────────────────
-
-run_primary_condition() {
     local name="$1"
-    local mbps="${PRIMARY_FLOOD_MBPS[$name]}"
-    local label="${PRIMARY_LABELS[$name]}"
-    local cond_dir="$RESULTS_DIR/$name"
-    local qemu_log="$cond_dir/qemu_serial.log"
-    mkdir -p "$cond_dir"
+    local exp_dir="$RESULTS_DIR/$name"
+    local qemu_log="$exp_dir/qemu_serial.log"
+    mkdir -p "$exp_dir"
+
+    # name is like "cpu_n4" or "baseline_n0"
+    local stressor="${name%%_*}"
+    local n_workers=${STRESSOR_WORKERS[$name]:-0}
+    local label="${STRESSOR_LABELS[$name]:-N=$n_workers}"
 
     # Build net_receiver command
-    local flood_arg=""
-    [[ "$mbps" -gt 0 ]] && flood_arg="-B $mbps"
-    local cmd="net_receiver -n $PACKETS_PER_RUN $flood_arg"
+    # local flood_arg=""
+    # [[ "$mbps" -gt 0 ]] && flood_arg="-B $mbps"
 
-    echo ""
+    local cmd="$CLIENT_BIN -n $PACKETS_PER_RUN"
+
+
     echo "============================================"
     echo "Condition: $name  ($label)"
     echo "Command:   $cmd"
@@ -320,111 +370,121 @@ run_primary_condition() {
     start_qemu "$qemu_log"
     wait_for_boot "$qemu_log" || { stop_qemu; return 1; }
     wait_for_ssh             || { stop_qemu; return 1; }
-    detect_remote_tshark
 
-    # Configure vnet_li_hi IP and wait for net_sender to be fully up
+    # Configure vnet_li_hi IP and wait for net_client to be fully up
     local vnet_iface
     vnet_iface=$(configure_vnet_iface)
-    sleep 3   # net_sender may still be initialising its socket
+    sleep 3   # net_client may still be initialising its socket
 
-    for run in $(seq 1 "$RUNS_PER_CONDITION"); do
-        local run_file="$cond_dir/run_$(printf '%02d' "$run").txt"
-        local tshark_file="$cond_dir/tshark_run_$(printf '%02d' "$run").log"
-        local tshark_remote_file="/tmp/tshark_${name}_run_$(printf '%02d' "$run").log"
-        local tshark_pid=""
-        echo -n "[$name] Run $run/$RUNS_PER_CONDITION ... "
+    if [[ $HICOM_MODE -eq 1 ]]; then
+        if ! wait_for_hi_ready "$qemu_log"; then
+            echo "ERROR: shm_ping_hi not ready for experiment $name. Skipping."
+            stop_qemu
+            return 1
+        fi
+    fi
 
-        tshark_pid=$(start_tshark_capture "eth0" "$tshark_remote_file")
-        [[ -n "$tshark_pid" ]] && sleep 1
+    # Give shm_echo (PID 1 on vm-hi) a moment to register in proxyshm
+    sleep 2
 
-        run_ssh "$cmd" > "$run_file" 2>&1
-        local exit_code=$?
+    if [[ $n_workers -gt 0 ]]; then
+        echo "Starting stress-ng for stressor '$stressor' with $n_workers workers"
+        local stress_timeout=$((100 * RUNS_PER_EXPERIMENT))  # seconds, enough for all runs to complete
+        echo "Stress-ng timeout: ${stress_timeout}s"
+        if [[ "$stressor" == "worst-case" ]]; then
+            run_ssh "stress-ng --cpu $n_workers --cache $n_workers --stream $n_workers --io $n_workers --perf --timeout ${stress_timeout}s --metrics-brief --verbose >/tmp/stressng.log 2>&1 &"
+        fi
+        run_ssh "stress-ng --${stressor} $n_workers --perf --timeout ${stress_timeout}s --metrics-brief --verbose >/tmp/stressng_${name}_run_$(printf '%02d' "$run").log 2>&1 &"
+    
 
-        stop_tshark_capture "$tshark_pid"
-        save_tshark_capture "$tshark_remote_file" "$tshark_file"
+        echo "Waiting for stress-ng to become active..."
+        sleep 3
 
-        if [[ $exit_code -gt 1 ]]; then
-            echo "FAILED (exit code: $exit_code)"
+        # Verify stress-ng is running
+        local stressng_check=$(run_ssh "pgrep -f 'stress-ng' | wc -l" 2>/dev/null || echo "0")
+        if [[ "$stressng_check" -gt 0 ]]; then
+            echo "✓ stress-ng verified running (processes: $stressng_check)"
         else
-            local lost mean_owl p99_owl
-            lost=$(grep -oP 'Packets lost:\s+\K[0-9]+' "$run_file" 2>/dev/null || echo "?")
-            mean_owl=$(grep -oP 'Mean:\s+\K[0-9.]+' "$run_file" | head -1 || echo "?")
-            p99_owl=$(grep -oP 'P99:\s+\K[0-9.]+' "$run_file" | head -1 || echo "?")
-            local flag=""
-            [[ "$exit_code" -eq 1 ]] && flag=" [LOSSES]"
-            echo "OK (lost: $lost, OWL mean: ${mean_owl} us, P99: ${p99_owl} us)${flag}"
+            echo "⚠ WARNING: stress-ng may not be running. Check logs."
+        fi
+    fi
+
+    for run in $(seq 1 "$RUNS_PER_EXPERIMENT"); do
+        local run_file="$exp_dir/run_$(printf '%02d' "$run").txt"
+        local cycles_file="$exp_dir/run_$(printf '%02d' "$run").csv"        
+        local run_label="[$name] Run $run/$RUNS_PER_EXPERIMENT"
+
+        echo -n "$run_label ... "
+
+        # vmstat collects CPU / memory / IO stats every second.
+        # After li_app finishes, the vmstat output is saved between markers
+        # AND as a separate file for independent analysis.
+        local monitor_duration=7
+        local vmstat_file="$exp_dir/run_$(printf '%02d' "$run")_vmstat.csv"
+        run_ssh "{
+              vmstat -n 1 $monitor_duration > /tmp/vmstat_out.txt 2>&1 &
+              VPID=\$!
+              $cmd
+              # Let vmstat exit naturally so buffered output is flushed before extraction.
+              wait \$VPID 2>/dev/null || true
+              sync
+              echo '===VMSTAT_START===';
+              cat /tmp/vmstat_out.txt;
+              echo '===VMSTAT_END===';
+              }" > "$run_file" 2>&1
+        local exit_code=$?
+        # Extract the vmstat output between the markers and save to a clean CSV file for analysis. If the file is empty after extraction, remove it.
+        sed -n '/===VMSTAT_START===/,/===VMSTAT_END===/{/===VMSTAT/d;p}' "$run_file" | \
+                normalize_vmstat_to_csv > "$vmstat_file"
+            [[ -s "$vmstat_file" ]] || rm -f "$vmstat_file"
+        
+        if [[ $HICOM_MODE -eq 0 ]]; then
+            sed -n '/===CSV_START===/,/===CSV_END===/{/===CSV/d;p}' "$run_file" | \
+                    fix_QEMU_serial_log_format > "$cycles_file"
+                [[ -s "$cycles_file" ]] || rm -f "$cycles_file"
+        fi
+        
+
+        if [[ $HICOM_MODE -eq 1 ]]; then
+            # Wait for the "HICOM_PING_DONE run=N" marker to ensure the run has fully completed
+            if ! wait_for_hi_done "$qemu_log" "$run"; then
+                echo "ERROR: Run $run did not complete successfully. Check console log."
+                continue
+            fi
+            # Extract the run's console output between the HI_NET_PING_START and HI_NET_PING_DONE markers for analysis
+            extract_run_results "$qemu_log" "$run" "$run_file" "$cycles_file"
         fi
 
-        sleep 2   # brief pause — net_sender keeps running between runs
-    done
-
-    stop_qemu
-}
-
-# ─── Run a Single Netem Condition ────────────────────────────────────────────
-
-run_netem_condition() {
-    local name="$1"
-    local netem_params="${NETEM_PARAMS[$name]}"
-    local label="${NETEM_LABELS[$name]}"
-    local cond_dir="$RESULTS_DIR/$name"
-    local qemu_log="$cond_dir/qemu_serial.log"
-    mkdir -p "$cond_dir"
-
-    local cmd="net_receiver -n $NETEM_PACKETS"
-
-    echo ""
-    echo "============================================"
-    echo "Netem condition: $name  ($label)"
-    echo "Command:         $cmd"
-    echo "Runs:            $NETEM_RUNS"
-    echo "============================================"
-
-    start_qemu "$qemu_log"
-    wait_for_boot "$qemu_log" || { stop_qemu; return 1; }
-    wait_for_ssh             || { stop_qemu; return 1; }
-    detect_remote_tshark
-
-    local vnet_iface
-    vnet_iface=$(configure_vnet_iface)
-    sleep 3
-
-    # Apply netem rule for this condition
-    apply_netem "$vnet_iface" "$netem_params"
-
-    for run in $(seq 1 "$NETEM_RUNS"); do
-        local run_file="$cond_dir/run_$(printf '%02d' "$run").txt"
-        local tshark_file="$cond_dir/tshark_run_$(printf '%02d' "$run").log"
-        local tshark_remote_file="/tmp/tshark_${name}_run_$(printf '%02d' "$run").log"
-        local tshark_pid=""
-        echo -n "[$name] Run $run/$NETEM_RUNS ... "
-
-        tshark_pid=$(start_tshark_capture "$vnet_iface" "$tshark_remote_file")
-        [[ -n "$tshark_pid" ]] && sleep 1
-
-        run_ssh "$cmd" > "$run_file" 2>&1
-        local exit_code=$?
-
-        stop_tshark_capture "$tshark_pid"
-        save_tshark_capture "$tshark_remote_file" "$tshark_file"
-
-        if [[ $exit_code -gt 1 ]]; then
+        if [[ $exit_code -ne 0 && $exit_code -ne 1 ]]; then
+            # exit 1 means messages were lost — still a valid run, just noted
             echo "FAILED (exit code: $exit_code)"
         else
-            local lost mean_owl
-            lost=$(grep -oP 'Packets lost:\s+\K[0-9]+' "$run_file" 2>/dev/null || echo "?")
-            mean_owl=$(grep -oP 'Mean:\s+\K[0-9.]+' "$run_file" | head -1 || echo "?")
-            local flag=""
-            [[ "$exit_code" -eq 1 ]] && flag=" [LOSSES]"
-            echo "OK (lost: $lost, OWL mean: ${mean_owl} us)${flag}"
+            # Quick-feedback: extract key metrics from the output
+            local lost
+            local mean_rtl
+            local p99_rtl
+            lost=$(awk '/^Lost \(no echo\):/ {print $4; exit}' "$run_file" 2>/dev/null || echo "?")
+            mean_rtl=$(grep -oP 'Mean:\s+\K[0-9.]+' "$run_file" | head -1 || echo "?")
+            p99_rtl=$(grep -oP 'P99:\s+\K[0-9.]+' "$run_file" | head -1 || echo "?")
+            if [[ "$exit_code" -eq 1 ]]; then
+                echo "OK (lost: $lost, mean: ${mean_rtl} us, P99: ${p99_rtl} us) [LOSSES DETECTED]"
+            fi
         fi
 
+        if [[ $n_workers -gt 0 ]]; then
+            echo "Stopping stress-ng for run $run..."
+            run_ssh "killall stress-ng 2>/dev/null || true"
+            sleep 1
+        fi
+
+        # Brief pause between runs — shm_echo remains running and ready
         sleep 2
     done
 
-    remove_netem "$vnet_iface"
     stop_qemu
 }
+
+
 
 # ─── Preflight ────────────────────────────────────────────────────────────────
 
@@ -442,62 +502,59 @@ check_dependencies() {
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
+    local all_conditions=()
+    local conditions_to_run=()
+    build_conditions all_conditions
+    filter_conditions all_conditions conditions_to_run "$SINGLE_STRESSOR"
+
     echo "========================================================"
     echo "Scenario 3 Experiment Orchestrator"
     echo "Network Communication Determinism"
     echo "========================================================"
-    echo "Runs per primary condition: $RUNS_PER_CONDITION"
+    echo "Runs per experiment:        $RUNS_PER_EXPERIMENT"
     echo "Packets per run:            $PACKETS_PER_RUN"
-    echo "Runs per netem condition:   $NETEM_RUNS (${NETEM_PACKETS} pkts)"
     echo "Results directory:          $RESULTS_DIR"
     echo ""
 
     check_dependencies
 
-    # Build the list of conditions to run
-    local all_primary=("${PRIMARY_NAMES[@]}")
-    local all_netem=("${NETEM_NAMES[@]}")
-
-    if [[ -n "$SINGLE_CONDITION" ]]; then
-        # Validate and route to the right runner
-        if [[ -n "${PRIMARY_FLOOD_MBPS[$SINGLE_CONDITION]+x}" ]]; then
-            run_primary_condition "$SINGLE_CONDITION"
-        elif [[ -n "${NETEM_PARAMS[$SINGLE_CONDITION]+x}" ]]; then
-            run_netem_condition "$SINGLE_CONDITION"
-        else
-            echo "ERROR: unknown condition '$SINGLE_CONDITION'"
-            echo "Primary:  ${PRIMARY_NAMES[*]}"
-            echo "Netem:    ${NETEM_NAMES[*]}"
+     if [[ -n "$SINGLE_STRESSOR" ]]; then
+        local valid_stressor=0
+        for stressor in "${STRESSOR_TYPES[@]}"; do
+            if [[ "$stressor" == "$SINGLE_STRESSOR" ]]; then
+                valid_stressor=1
+                break
+            fi
+        done
+        if [[ $valid_stressor -ne 1 ]]; then
+            echo "ERROR: Unknown stressor '$SINGLE_STRESSOR'"
+            echo "Available: ${STRESSOR_TYPES[*]}"
             exit 1
         fi
-        return
     fi
 
-    local total_primary=$(( ${#all_primary[@]} * RUNS_PER_CONDITION ))
-    local total_netem=$(( ${#all_netem[@]} * NETEM_RUNS ))
-    local total=$(( total_primary + total_netem ))
-    local est_min=$(( (total_primary * 8 + total_netem * 2 +
-                       (${#all_primary[@]} + ${#all_netem[@]}) * 180) / 60 ))
-    echo "Total runs: $total  ($total_primary primary + $total_netem netem)"
-    echo "Estimated:  ~${est_min} minutes"
-    echo "QEMU restarts once per condition."
+    local total_runs=$(( ${#conditions_to_run[@]} * RUNS_PER_EXPERIMENT ))
+
+
+    # Each run takes ~(n_messages * RTL + 2s ramp + 2s pause) ≈ 10-30s
+    # Plus ~3 min boot overhead per condition
+    local est_minutes=$(( (total_runs * 30 + ${#conditions_to_run[@]} * 180) / 60 ))
+    echo "Total runs:          $total_runs across ${#conditions_to_run[@]} conditions"
+    echo "Estimated time:      ~${est_minutes} minutes"
+    echo "QEMU restarts:       once per condition"
     echo ""
 
-    for cond in "${all_primary[@]}"; do
-        run_primary_condition "$cond"
-    done
-
-    for cond in "${all_netem[@]}"; do
-        run_netem_condition "$cond"
+    for condition in "${conditions_to_run[@]}"; do
+        run_experiment "$condition"
     done
 
     echo ""
     echo "========================================================"
-    echo "All conditions completed."
+    echo "All experiments completed."
     echo "Results saved to: $RESULTS_DIR"
     echo "========================================================"
     echo ""
-    echo "Next: python3 experiments/analyze_scenario3.py"
+    python3 s3_plots.py -r "$RESULTS_DIR"
 }
 
 main

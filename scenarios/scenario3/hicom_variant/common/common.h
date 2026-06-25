@@ -44,7 +44,7 @@
 #define SENDER_PERIOD_NS    1000000ULL
 
 /** Receive timeout on the pinger waiting for an echo (milliseconds). */
-#define RECV_TIMEOUT_MS     100
+#define RECV_TIMEOUT_MS     10
 
 /* ── Payload ───────────────────────────────────────────────────────────── */
 

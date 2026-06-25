@@ -34,7 +34,7 @@
 /* Receive timeout on the pinger waiting for an echo (milliseconds).
  * Must be >> expected RTL (< 1 ms in QEMU) and << probe period (1000 ms)
  * so a lost echo is declared quickly without stalling the send schedule. */
-#define RECV_TIMEOUT_MS     100
+#define RECV_TIMEOUT_MS     10
 
 /* Control packet sequence values — outside the 0-based data sequence. */
 #define NET_CTRL_SEQ_HELLO        UINT64_MAX

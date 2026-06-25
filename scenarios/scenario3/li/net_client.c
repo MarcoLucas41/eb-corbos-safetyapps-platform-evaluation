@@ -1,14 +1,13 @@
 /*
- * net_sender_li.c — Scenario 3 reversed variant: pinger / RTL measurer (vm-li)
+ * net_client.c — Scenario 3 
  *
  * Sends periodic probes to the echo server (net_receiver_hi) on vm-hi at
- * 1 ms intervals, then receives each echo and measures Round-Trip Latency
- * (RTL) on its own CLOCK_MONOTONIC.  Both timestamps (send + recv) are on
+ * 1 ms intervals, then receives each echo and measures Round-Trip Time
+ * (RTT) on its own CLOCK_MONOTONIC.  Both timestamps (send + recv) are on
  * vm-li's clock, so no cross-VM synchronisation is required.
  *
- * This is the counterpart to net_receiver.c in the normal scenario.
  *
- * Usage: net_sender_li [-n <probes>] [-B <Mbps>] [-t] [-o <csv>]
+ * Usage: net_client [-n <probes>] [-B <Mbps>] [-t] [-o <csv>]
  */
 
 #define _GNU_SOURCE
@@ -60,9 +59,9 @@ static void configure_realtime(void)
 {
     struct sched_param param = { .sched_priority = 90 };
     if (sched_setscheduler(0, SCHED_FIFO, &param) != 0)
-        printf("net_sender_li: SCHED_FIFO FAILED (%s) — SCHED_OTHER\n", strerror(errno));
+        printf("net_client: SCHED_FIFO FAILED (%s) — SCHED_OTHER\n", strerror(errno));
     else
-        printf("net_sender_li: SCHED_FIFO OK (priority 90)\n");
+        printf("net_client: SCHED_FIFO OK (priority 90)\n");
 }
 
 /* ── TCP helper ───────────────────────────────────────────────────────────── */
@@ -118,30 +117,31 @@ static void print_metric(const char *label, const uint64_t *samples, size_t n)
            pct(sorted,n,0.50)/1e3, pct(sorted,n,0.95)/1e3);
     printf("  P99:  %8.3f    P99.9:   %.3f\n",
            pct(sorted,n,0.99)/1e3, pct(sorted,n,0.999)/1e3);
+
 }
 
-static void write_csv(const char     *path,
-                      const uint64_t *seqs,
-                      const uint64_t *send_ns,
-                      const uint64_t *recv_ns,
-                      const uint64_t *rtl_ns,
-                      const uint64_t *iaj_ns,
-                      size_t          n)
-{
-    FILE *fp = fopen(path, "w");
-    if (!fp) { printf("WARNING: open CSV '%s': %s\n", path, strerror(errno)); return; }
-    fprintf(fp, "seq,send_time_ns,recv_time_ns,rtlatency_us,iat_us\n");
-    for (size_t i = 0; i < n; i++) {
-        fprintf(fp, "%llu,%llu,%llu,%.3f,%.3f\n",
-                (unsigned long long)seqs[i],
-                (unsigned long long)send_ns[i],
-                (unsigned long long)recv_ns[i],
-                (double)rtl_ns[i] / 1e3,
-                i > 0 ? (double)iaj_ns[i - 1] / 1e3 : 0.0);
-    }
-    fclose(fp);
-    printf("CSV written to: %s\n", path);
-}
+// static void write_csv(const char     *path,
+//                       const uint64_t *seqs,
+//                       const uint64_t *send_ns,
+//                       const uint64_t *recv_ns,
+//                       const uint64_t *rtl_ns,
+//                       const uint64_t *iaj_ns,
+//                       size_t          n)
+// {
+//     FILE *fp = fopen(path, "w");
+//     if (!fp) { printf("WARNING: open CSV '%s': %s\n", path, strerror(errno)); return; }
+//     fprintf(fp, "seq,send_time_ns,recv_time_ns,rtlatency_us,iat_us\n");
+//     for (size_t i = 0; i < n; i++) {
+//         fprintf(fp, "%llu,%llu,%llu,%.3f,%.3f\n",
+//                 (unsigned long long)seqs[i],
+//                 (unsigned long long)send_ns[i],
+//                 (unsigned long long)recv_ns[i],
+//                 (double)rtl_ns[i] / 1e3,
+//                 i > 0 ? (double)iaj_ns[i - 1] / 1e3 : 0.0);
+//     }
+//     fclose(fp);
+//     printf("CSV written to: %s\n", path);
+// }
 
 /* ── Background flood helper ────────────────────────────────────────────────────── */
 
@@ -172,24 +172,20 @@ int main(int argc, char *argv[])
     bool        tcp_mode   = false;
     int         n_probes   = 5000;
     int         flood_mbps = 0;
-    const char *csv_path   = "net_sender_li_log.csv";
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             n_probes = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-t") == 0) {
             tcp_mode = true;
-        } else if (strcmp(argv[i], "-B") == 0 && i + 1 < argc) {
-            flood_mbps = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
-            csv_path = argv[++i];
+        // } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+        //     csv_path = argv[++i];
         } else if (strcmp(argv[i], "-h") == 0 ||
                    strcmp(argv[i], "--help") == 0) {
             printf("Usage: %s [options]\n", argv[0]);
             printf("  -n <count>  Probes to send (default: 5000, max: %d)\n", MAX_SAMPLES);
             printf("  -t          Use TCP (default: UDP)\n");
-            printf("  -B <Mbps>   Flood rate in Mbps (default: 0 = off)\n");
-            printf("  -o <file>   Output CSV (default: net_sender_li_log.csv)\n");
+            printf("  -o <file>   Output CSV (default: net_client_log.csv)\n");
             printf("  -h          Show this help\n");
             return 0;
         }
@@ -201,7 +197,7 @@ int main(int argc, char *argv[])
     }
 
     printf("========================================\n");
-    printf("net_sender_li (pinger) — Scenario 3 reversed\n");
+    printf("net_client (pinger) — Scenario 3 reversed\n");
     printf("EB corbos Linux Network Determinism\n");
     printf("Metric: Round-Trip Latency (RTL)\n");
     printf("========================================\n");
@@ -218,7 +214,7 @@ int main(int argc, char *argv[])
     signal(SIGINT, sigint_handler);
 
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
-        printf("net_sender_li: mlockall: %s — continuing\n", strerror(errno));
+        printf("net_client: mlockall: %s — continuing\n", strerror(errno));
 
     /* ── Create UDP socket for handshake ───────────────────────────────────────────────── */
 
@@ -238,7 +234,7 @@ int main(int argc, char *argv[])
     src.sin_port        = 0;  /* kernel assigns ephemeral port */
     src.sin_addr.s_addr = inet_addr(NET_LI_IP);
     if (bind(sock, (struct sockaddr *)&src, sizeof(src)) != 0)
-        printf("net_sender_li: WARNING: bind(%s): %s\n", NET_LI_IP, strerror(errno));
+        printf("net_client: WARNING: bind(%s): %s\n", NET_LI_IP, strerror(errno));
 
     /* connect() scopes send()/recv() to the echo server. */
     struct sockaddr_in dst = {0};
@@ -290,7 +286,7 @@ int main(int argc, char *argv[])
         }
 
         if (!acked) {
-            printf("net_sender_li: interrupted during handshake\n");
+            printf("net_client: interrupted during handshake\n");
             close(sock);
             return 1;
         }
@@ -335,7 +331,6 @@ int main(int argc, char *argv[])
 
     static uint64_t rtl_ns  [MAX_SAMPLES];
     static uint64_t iaj_ns  [MAX_SAMPLES];
-    static uint64_t seq_arr [MAX_SAMPLES];
     static uint64_t send_arr[MAX_SAMPLES];
     static uint64_t recv_arr[MAX_SAMPLES];
 
@@ -410,7 +405,11 @@ int main(int argc, char *argv[])
 
         /* ── Record RTL and IAJ ──────────────────────────────────────────────── */
 
-        uint64_t rtl = recv_time_ns - echo.send_time_ns;
+        uint64_t rtl = recv_time_ns - msg.send_time_ns;
+        if (rtl > RECV_TIMEOUT_MS * 1000000ULL) {
+            n_lost++;
+            last_was_loss = true;
+        }
 
         if (prev_recv_ns != 0 && !last_was_loss && n_iaj < MAX_SAMPLES) {
             uint64_t iat = recv_time_ns - prev_recv_ns;
@@ -419,17 +418,16 @@ int main(int argc, char *argv[])
         }
 
         rtl_ns  [n_stored] = rtl;
-        seq_arr [n_stored] = seq;
-        send_arr[n_stored] = echo.send_time_ns;
+        send_arr[n_stored] = msg.send_time_ns;
         recv_arr[n_stored] = recv_time_ns;
         n_stored++;
 
         prev_recv_ns  = recv_time_ns;
         last_was_loss = false;
 
-        if (n_stored % 1000 == 0)
-            printf("Progress: %zu/%d  (lost: %llu)\n",
-                   n_stored, n_probes, (unsigned long long)n_lost);
+        // if (n_stored % 1000 == 0)
+        //     printf("Progress: %zu/%d  (lost: %llu)\n",
+        //            n_stored, n_probes, (unsigned long long)n_lost);
 
         seq++;
         next_wake += SENDER_PERIOD_NS;
@@ -462,9 +460,14 @@ int main(int argc, char *argv[])
     print_metric("RTL", rtl_ns, n_stored);
     print_metric("IAJ", iaj_ns, n_iaj);
 
-    printf("===================================================\n");
+    printf("===CSV_START===\n");
+    printf("index,send_time_ns,recv_time_ns,rtl_ns,iaj_ns\n");
+    for (size_t i = 0; i < n_stored; i++) {
+        printf("%zu,%llu,%llu,%llu,%llu\n", i, (unsigned long long)send_arr[i], (unsigned long long)recv_arr[i], (unsigned long long)rtl_ns[i], (unsigned long long)iaj_ns[i]);
+    }
+    printf("===CSV_END===\n");
 
-    write_csv(csv_path, seq_arr, send_arr, recv_arr, rtl_ns, iaj_ns, n_stored);
+    printf("===================================================\n");
 
     if (!tcp_mode) close(sock);
     return (n_lost == 0) ? 0 : 1;

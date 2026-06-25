@@ -292,11 +292,13 @@ static void run_pings(bool tcp_mode, int n_probes, int run_idx)
     /* ── Ping-echo loop ───────────────────────────────────────────────── */
 
     uint64_t seq       = 0;
-    uint64_t next_wake = get_time_ns() + SENDER_PERIOD_NS;
+    uint64_t start_ns  = get_time_ns();
+    uint64_t next_wake = start_ns + SENDER_PERIOD_NS;
 
     while (seq < (uint64_t)n_probes) {
 
-        /* Absolute-time sleep. */
+        /* Sleep until the next absolute period boundary. */
+         /* Absolute-time sleep. */
         uint64_t now = get_time_ns();
         if (now < next_wake) {
             struct timespec ts = ns_to_timespec(next_wake - now);
@@ -305,10 +307,12 @@ static void run_pings(bool tcp_mode, int n_probes, int run_idx)
             next_wake = now; /* drop backlog */
         }
 
+
         /* ── Send probe ───────────────────────────────────────────────── */
 
         memset(msg.payload, 0xAB, sizeof(msg.payload));
         msg.seq          = seq;
+
         msg.send_time_ns = get_time_ns();   /* vm-hi clock */
 
         if (send(sock, &msg, sizeof(msg), 0) < 0) {
@@ -349,7 +353,13 @@ static void run_pings(bool tcp_mode, int n_probes, int run_idx)
 
         /* ── Record RTL and IAJ ───────────────────────────────────────── */
 
-        uint64_t rtl = recv_time_ns - echo.send_time_ns;
+        uint64_t rtl = recv_time_ns - msg.send_time_ns;
+        if (rtl > RECV_TIMEOUT_MS * 1000000ULL) {
+            // printf("WARNING: seq=%llu: RTL %llu us exceeds timeout — treating as loss\n",
+            //        (unsigned long long)seq, rtl / 1000);
+            n_lost++;
+            last_was_loss = true;
+        }
 
         if (prev_recv_ns != 0 && !last_was_loss && n_iaj < MAX_SAMPLES) {
             uint64_t iat = recv_time_ns - prev_recv_ns;
@@ -363,10 +373,10 @@ static void run_pings(bool tcp_mode, int n_probes, int run_idx)
         prev_recv_ns  = recv_time_ns;
         last_was_loss = false;
 
-        if ((seq + 1) % 1000 == 0)
-            printf("Progress: %llu/%d  (lost: %llu)\n",
-                   (unsigned long long)(seq + 1), n_probes,
-                   (unsigned long long)n_lost);
+        // if ((seq + 1) % 1000 == 0)
+        //     printf("Progress: %llu/%d  (lost: %llu)\n",
+        //            (unsigned long long)(seq + 1), n_probes,
+        //            (unsigned long long)n_lost);
 
         seq++;
         next_wake += SENDER_PERIOD_NS;
@@ -388,9 +398,21 @@ static void run_pings(bool tcp_mode, int n_probes, int run_idx)
 
     print_metric("RTL", rtl_ns, n_stored);
     print_metric("IAJ", iaj_ns, n_iaj);
+    
+    printf("===CSV_START===\n");
+    printf("index,rtl_ns,iaj_ns\n");
+    for (size_t i = 0; i < n_stored; i++) {
+        printf("%zu,%llu,%llu\n", i, (unsigned long long)rtl_ns[i], (unsigned long long)iaj_ns[i]);
+    }
+    printf("===CSV_END===\n");
 
+    
     printf("=========================================\n");
     printf("HI_NET_PING_DONE run=%d\n\n", run_idx);
+
+   
+
+    
 }
 
 /* ── Main ────────────────────────────────────────────────────────────────── */
