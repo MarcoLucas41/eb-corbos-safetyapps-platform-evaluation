@@ -29,14 +29,14 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../../../images/arm64/qemu/ebclfsa" && pwd)"
 RESULTS_ROOT="$SCRIPT_DIR/results"
 RESULTS_LI_ROOT="$SCRIPT_DIR/results_li"
 
-RUNS_PER_EXPERIMENT=10
-DURATION=30
+RUNS_PER_EXPERIMENT=30
+DURATION=15
 DEADLINE_MISS_THRESHOLD_MS=5
 SPEEDOMETER_UPDATE_HZ=20
 SINGLE_STRESSOR=""
 LI_MODE=0
 
-CLIENT_BIN="stress_workload"
+CLIENT_BIN="speedometer_trigger"
 
 SSH_PORT=2222
 SSH_USER="root"
@@ -44,16 +44,12 @@ SSH_HOST="localhost"
 SSH_PASS="linux"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 
-BOOT_MARKER="Ubuntu 22.04.5 LTS ebclfsa-li hvc0"
-BOOT_TIMEOUT=180   # seconds to wait for boot
-SSH_TIMEOUT=120     # seconds to wait for SSH readiness
+BOOT_MARKER="Ubuntu 22.04 LTS ebclfsa-li hvc0"
+BOOT_TIMEOUT=60   # seconds to wait for boot
+SSH_TIMEOUT=60    # seconds to wait for SSH readiness
 
-STRESSOR_TYPES=(baseline cpu cache stream io "worst-case")
+STRESSOR_TYPES=(baseline cpu cache stream io worst-case)
 NUM_WORKERS_LIST=(n2 n4 n8)
-# NUM_WORKERS_LIST=(n2 n4 n8 n16 n32)
-
-
-# declare -A NUM_WORKERS_MAP=( [n2]=2 [n4]=4 [n8]=8 [n16]=16 [n32]=32 )
 
 declare -A NUM_WORKERS_MAP=( [n2]=2 [n4]=4 [n8]=8 )
 
@@ -288,7 +284,7 @@ run_experiment() {
     local n_workers=${STRESSOR_WORKERS[$name]:-0}
     local label="${STRESSOR_LABELS[$name]:-N=$n_workers}"
 
-    # Build the stress_workload command
+    # Build the speedometer_trigger command
     local cmd="$CLIENT_BIN -d $DURATION -dm $DEADLINE_MISS_THRESHOLD_MS -hz $SPEEDOMETER_UPDATE_HZ"
 
     echo "============================================"
@@ -310,33 +306,17 @@ run_experiment() {
         return 1
     fi
 
-    # Start stress-ng once for this condition, before any run begins.
     if [[ $n_workers -gt 0 ]]; then
         echo "Starting stress-ng for stressor '$stressor' with $n_workers workers"
-        # Calculate timeout: 10s per run + 5s overhead, capped at 5 minutes
-        # local stress_timeout=$(( (RUNS_PER_EXPERIMENT * 10) + 5 ))
-        # [[ $stress_timeout -gt 300 ]] && stress_timeout=300
-        local stress_timeout=600
-        
-        case "$stressor" in
-            cpu)
-                run_ssh "stress-ng --cpu $n_workers --perf --timeout ${stress_timeout}s --metrics-brief --verbose >/tmp/stressng_${name}.log 2>&1 &"
-                ;;
-            cache)
-                run_ssh "stress-ng --cache $n_workers --perf --timeout ${stress_timeout}s --metrics-brief --verbose >/tmp/stressng_${name}.log 2>&1 &"
-                ;;
-            stream)
-                run_ssh "stress-ng --stream $n_workers --perf --timeout ${stress_timeout}s --metrics-brief --verbose >/tmp/stressng_${name}.log 2>&1 &"
-                ;;
-            io)
-                run_ssh "stress-ng --io $n_workers --perf --timeout ${stress_timeout}s --metrics-brief --verbose >/tmp/stressng_${name}.log 2>&1 &"
-                ;;
-            "worst-case")
-                run_ssh "stress-ng --cpu $n_workers --cache $n_workers --stream $n_workers --io $n_workers --perf --timeout ${stress_timeout}s --metrics-brief --verbose >/tmp/stressng_${name}.log 2>&1 &"
-                ;;
-        esac
+        local stress_timeout=$((100 * RUNS_PER_EXPERIMENT))  # seconds, enough for all runs to complete
+        echo "Stress-ng timeout: ${stress_timeout}s"
+        if [[ "$stressor" == "worst-case" ]]; then
+            run_ssh "stress-ng --cpu $n_workers --cache $n_workers --stream $n_workers --io $n_workers --perf --timeout ${stress_timeout}s --metrics-brief --verbose >/tmp/stressng_${name}_run_$(printf '%02d' "$run").log 2>&1 &"
+        fi
+        run_ssh "stress-ng --${stressor} $n_workers --perf --timeout ${stress_timeout}s --metrics-brief --verbose >/tmp/stressng_${name}_run_$(printf '%02d' "$run").log 2>&1 &"
+    
 
-        echo "Waiting 3s for stress-ng to ramp up..."
+        echo "Waiting for stress-ng to become active..."
         sleep 3
 
         # Verify stress-ng is running
@@ -349,33 +329,31 @@ run_experiment() {
     fi
 
     for run in $(seq 1 "$RUNS_PER_EXPERIMENT"); do
-        local run_num=$(printf '%02d' "$run")
-        local run_file="$exp_dir/run_${run_num}.txt"
-        local cycles_file="$exp_dir/run_${run_num}_cycles.csv"
+        local run_file="$exp_dir/run_$(printf '%02d' "$run").txt"
+        local cycles_file="$exp_dir/run_$(printf '%02d' "$run").csv"
         local run_label="[$name] Run $run/$RUNS_PER_EXPERIMENT"
+
 
         echo -n "$run_label ... "
 
         # Track serial log length so we can extract new CSV data after the run
         local log_lines_before=$(wc -l < "$qemu_log" 2>/dev/null || echo 0)
 
-        # Run the experiment via SSH and capture output
-        # run_ssh "$cmd" > "$run_file" 2>&1
-        # local exit_code=$?
+        # Run low integrity app with vmstat monitoring in the background.
 
-        # Run li_app with vmstat monitoring in the background.
         # vmstat collects CPU / memory / IO stats every second.
-        # After li_app finishes, the vmstat output is saved between markers
+        # After low-integrity app finishes, the vmstat output is saved between markers
         # AND as a separate file for independent analysis.
         local monitor_duration=$((DURATION + 2)) # Slightly longer than app duration to capture tail-end behavior
-        local vmstat_file="$exp_dir/run_${run_num}_vmstat.csv"
-        local speedometer_vmstat_file="$exp_dir/run_${run_num}_speedometer_vmstat.csv"
+        local vmstat_file="$exp_dir/run_$(printf '%02d' "$run")_vmstat.csv"
+
+        # local speedometer_vmstat_file="$exp_dir/run_$(printf '%02d' "$run")_speedometer_vmstat.csv"
 
         run_ssh "{
-              vmstat -n 1 $monitor_duration > /tmp/vmstat_out.txt 2>&1 &
+              vmstat -n 1 "$monitor_duration" > /tmp/vmstat_out.txt 2>&1 &
               VPID=\$!
               $cmd
-              kill \$VPID 2>/dev/null; wait \$VPID 2>/dev/null
+              wait \$VPID 2>/dev/null
               sync
               echo '===VMSTAT_START===';
               cat /tmp/vmstat_out.txt;
@@ -383,7 +361,7 @@ run_experiment() {
               }" > "$run_file" 2>&1
         local exit_code=$?
 
-         # Save LI-side vmstat as real CSV (comma-separated)
+         # Save LI-side vmstat and cycles data as CSV (comma-separated)
         if [[ $LI_MODE -eq 1 && -f "$run_file" ]]; then
             sed -n '/===VMSTAT_START===/,/===VMSTAT_END===/{/===VMSTAT/d;p}' "$run_file" | \
                 normalize_vmstat_to_csv > "$vmstat_file"
@@ -397,7 +375,7 @@ run_experiment() {
            
             # Wait for QEMU serial log to flush before extracting per-cycle CSV.
             # The hi VM dumps CSV via the serial port; QEMU may buffer the output.
-            sleep 5
+            sleep 1
 
             local log_chunk
             local clean_chunk
@@ -418,9 +396,9 @@ run_experiment() {
                 normalize_vmstat_to_csv > "$vmstat_file"
             [[ -s "$vmstat_file" ]] || rm -f "$vmstat_file"
 
-            sed -n '/===VMSTAT_START===/,/===VMSTAT_END===/{/===VMSTAT/d;p}' "$clean_chunk" | \
-                normalize_vmstat_to_csv > "$speedometer_vmstat_file"
-            [[ -s "$speedometer_vmstat_file" ]] || rm -f "$speedometer_vmstat_file"
+            # sed -n '/===VMSTAT_START===/,/===VMSTAT_END===/{/===VMSTAT/d;p}' "$clean_chunk" | \
+            #     normalize_vmstat_to_csv > "$speedometer_vmstat_file"
+            # [[ -s "$speedometer_vmstat_file" ]] || rm -f "$speedometer_vmstat_file"
 
             rm -f "$clean_chunk"
             rm -f "$log_chunk"
@@ -434,21 +412,14 @@ run_experiment() {
             echo "OK (misses: $misses)"
         fi
 
-        # Brief pause between runs to let the speedometer reset
-        sleep 2
     done
 
     # Retrieve stress-ng log before stopping QEMU
     if [[ $n_workers -gt 0 ]]; then
         echo "Retrieving stress-ng log..."
         sshpass -p "$SSH_PASS" scp $SSH_OPTS -P "$SSH_PORT" "$SSH_USER@$SSH_HOST:/tmp/stressng_${name}.log" "$exp_dir/stressng.log" 2>/dev/null || true
-    fi
-
-    # Stop stress-ng before tearing down QEMU
-    if [[ $n_workers -gt 0 ]]; then
         echo "Stopping stress-ng..."
         run_ssh "killall stress-ng 2>/dev/null || true"
-        sleep 1
     fi
 
     # Shut down QEMU after this scenario
@@ -492,8 +463,8 @@ main() {
 
     local total_runs=$(( ${#conditions_to_run[@]} * RUNS_PER_EXPERIMENT ))
 
-    # Add ~3 min boot overhead per scenario
-    local est_minutes=$(( (total_runs * (DURATION + 10) + ${#conditions_to_run[@]} * 180) / 60 ))
+    # Add ~1 min boot overhead per scenario
+    local est_minutes=$(( (total_runs * (DURATION) + ${#conditions_to_run[@]} * 60) / 60 ))
     echo ""
     echo "Total runs: $total_runs across ${#conditions_to_run[@]} scenarios"
     echo "QEMU will restart between scenarios for clean state."
@@ -507,11 +478,9 @@ main() {
     echo ""
     echo "========================================================"
     echo "All experiments completed."
-    echo "Generating deadline miss plots..."
     echo "Results saved to: $RESULTS_DIR"
     echo "========================================================"
     echo ""
-    python3 plot_deadline_misses.py "$RESULTS_DIR" --all
     # python3 s1_plots.py -r "$RESULTS_DIR"
 }
 
