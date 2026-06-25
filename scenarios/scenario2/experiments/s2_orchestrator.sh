@@ -28,7 +28,8 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../../../images/arm64/qemu/ebclfsa" && pwd)"
 RESULTS_ROOT="$SCRIPT_DIR/results"
 RESULTS_HICOM_ROOT="$SCRIPT_DIR/results_hicom"
 
-RUNS_PER_EXPERIMENT=10
+VMSTAT_DURATION=5   # seconds to run vmstat for each ping run (should cover the whole run duration)
+RUNS_PER_EXPERIMENT=30
 PINGS_PER_RUN=2000
 SINGLE_STRESSOR=""
 HICOM_MODE=0
@@ -48,14 +49,14 @@ SSH_PASS="linux"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 
 BOOT_MARKER="Ubuntu 22.04 LTS ebclfsa-li hvc0"
-BOOT_TIMEOUT=180
-SSH_TIMEOUT=120
+BOOT_TIMEOUT=60
+SSH_TIMEOUT=60
 
 
-STRESSOR_TYPES=(baseline cpu cache stream io "worst-case")
-NUM_WORKERS_LIST=(n4 n8)
+STRESSOR_TYPES=(baseline cpu cache stream io worst-case)
+NUM_WORKERS_LIST=(n2 n4 n8)
 
-declare -A NUM_WORKERS_MAP=( [n4]=4 [n8]=8 )
+declare -A NUM_WORKERS_MAP=( [n2]=2 [n4]=4 [n8]=8 )
 
 # Condition-level mappings (populated below)
 declare -A STRESSOR_WORKERS
@@ -80,6 +81,43 @@ fix_QEMU_serial_log_format() {
 
         line = trim(line)
         if (line == "") next
+
+        # Remove trailing commas
+        sub(/,+$/, "", line)
+
+        if (line != "") print line
+    }'
+}
+
+# Normalize vmstat text into clean CSV:
+# - remove ANSI escape codes
+# - remove serial prefix like "vm-hi,|," or "vm-hi |"
+# - convert whitespace-delimited vmstat rows to comma-delimited
+# - drop trailing commas
+normalize_vmstat_to_csv() {
+    awk '
+    function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+    {
+        line = $0
+        gsub(/\r/, "", line)
+
+        # Strip ANSI colors/sequences
+        gsub(/\033\[[0-9;]*[[:alpha:]]/, "", line)
+
+        # Strip QEMU serial prefixes
+        sub(/^[[:space:]]*vm-hi[[:space:]]*\|[[:space:]]*/, "", line)
+        sub(/^[[:space:]]*vm-hi,\|,/, "", line)
+
+        # Strip kernel log prefixes like "[  552.333704] random: crng init"
+        sub(/^\[[[:space:]]*[0-9.]+\][^,]*/, "", line)
+
+        line = trim(line)
+        if (line == "") next
+
+        # If not already comma-separated, convert runs of spaces/tabs to commas
+        if (line !~ /,/) {
+            gsub(/[[:space:]]+/, ",", line)
+        }
 
         # Remove trailing commas
         sub(/,+$/, "", line)
@@ -272,12 +310,22 @@ extract_run_results() {
     local log_file="$1"
     local run_idx="$2"
     local dest_file="$3"
+    local cycles_file="$4"
 
+    # If configuration A:
+    
+    # awk \
+    #     "/HICOM_PING_START run=${run_idx}/{found=1} \
+    #      found{print} \
+    #      /HICOM_PING_DONE run=${run_idx}/{found=0}" \
+    #     "$log_file" | fix_QEMU_serial_log_format > "$dest_file"
+    # # Extract the CSV lines and save to cycles_file
     awk \
-        "/HICOM_PING_START run=${run_idx}/{found=1} \
-         found{print} \
-         /HICOM_PING_DONE run=${run_idx}/{found=0}" \
-        "$log_file" | fix_QEMU_serial_log_format > "$dest_file"
+        "/===CSV_START===/{in_csv=1; next} \
+         /===CSV_END===/{in_csv=0} \
+         in_csv{print}" \
+        "$run_file" > "$cycles_file"
+
 }
 
 stop_qemu() {
@@ -341,43 +389,18 @@ run_experiment() {
     # Give shm_echo (PID 1 on vm-hi) a moment to register in proxyshm
     sleep 2
 
-    # Start stress-ng once for this condition, before any run begins.
+    
+
+    # Start stress-ng fresh for this run so each sample has its own interference window.
     if [[ $n_workers -gt 0 ]]; then
         echo "Starting stress-ng for stressor '$stressor' with $n_workers workers"
-        # Calculate timeout: 10s per run + 5s overhead, capped at 5 minutes
-        local stress_timeout=$(( (RUNS_PER_EXPERIMENT * 10) + 5 ))
-        [[ $stress_timeout -gt 300 ]] && stress_timeout=300
-        
-        case "$stressor" in
-            cpu)
-                run_ssh "stress-ng --cpu $n_workers --perf --timeout ${stress_timeout}s --metrics-brief --verbose >/tmp/stressng_${name}.log 2>&1 &"
-                ;;
-            shm)
-                # avail_mb=$(run_ssh "awk '/MemAvailable/{print int(\$2/1024)}' /proc/meminfo")
-                # Use 70% of available memory, split across workers
-                # Cap per-worker at 64M (larger than any L3 cache — enough for cache pressure)
-                # Floor per-worker at 4M (below this, negligible cache interference)
-                # budget_mb=$(( avail_mb * 70 / 100 ))
-                # per_worker_mb=$(( budget_mb / n_workers ))
-                # per_worker_mb=$(( per_worker_mb > 64 ? 64 : per_worker_mb ))
-                # per_worker_mb=$(( per_worker_mb < 4  ?  4 : per_worker_mb ))
-                # echo "Allocating ${per_worker_mb}MB per worker for shm stress (total budget: ${budget_mb}MB)"
-                run_ssh "stress-ng --shm $n_workers --shm-bytes 1M --perf --timeout ${stress_timeout}s --metrics-brief --verbose >/tmp/stressng_${name}.log 2>&1 &"
-                ;;
-            cache)
-                run_ssh "stress-ng --cache $n_workers --perf --timeout ${stress_timeout}s --metrics-brief --verbose >/tmp/stressng_${name}.log 2>&1 &"
-                ;;
-            stream)
-                run_ssh "stress-ng --stream $n_workers --perf --timeout ${stress_timeout}s --metrics-brief --verbose >/tmp/stressng_${name}.log 2>&1 &"
-                ;;
-            io)
-                run_ssh "stress-ng --io $n_workers --perf --timeout ${stress_timeout}s --metrics-brief --verbose >/tmp/stressng_${name}.log 2>&1 &"
-                ;;
-            "worst-case")
-                run_ssh "stress-ng --cpu $n_workers --shm $n_workers --shm-bytes 1M --cache $n_workers --stream $n_workers --io $n_workers --perf --timeout ${stress_timeout}s --metrics-brief --verbose >/tmp/stressng_${name}.log 2>&1 &"
-                ;;
-        esac
-
+        local stress_timeout=$((100 * RUNS_PER_EXPERIMENT))  # seconds, enough for all runs to complete
+        echo "Stress-ng timeout: ${stress_timeout}s"
+        if [[ "$stressor" == "worst-case" ]]; then
+            run_ssh "stress-ng --cpu $n_workers --cache $n_workers --stream $n_workers --io $n_workers --perf --timeout ${stress_timeout}s --metrics-brief --verbose >/tmp/stressng.log 2>&1 &"
+        fi
+        run_ssh "stress-ng --${stressor} $n_workers --perf --timeout ${stress_timeout}s --metrics-brief --verbose >/tmp/stressng.log 2>&1 &"
+       
         echo "Waiting 3s for stress-ng to ramp up..."
         sleep 3
 
@@ -393,12 +416,38 @@ run_experiment() {
 
     for run in $(seq 1 "$RUNS_PER_EXPERIMENT"); do
         local run_file="$exp_dir/run_$(printf '%02d' "$run").txt"
+        local cycles_file="$exp_dir/run_$(printf '%02d' "$run").csv"
         local run_label="[$name] Run $run/$RUNS_PER_EXPERIMENT"
 
         echo -n "$run_label ... "
 
-        run_ssh "$cmd" > "$run_file" 2>&1
+        # vmstat collects CPU / memory / IO stats every second.
+        # After li_app finishes, the vmstat output is saved between markers
+        # AND as a separate file for independent analysis.
+        
+        local monitor_duration=$((VMSTAT_DURATION + 2)) # Slightly longer than app duration to capture tail-end behavior
+        local vmstat_file="$exp_dir/run_$(printf '%02d' "$run")_vmstat.csv"
+        run_ssh "{
+              vmstat -n 1 "$monitor_duration" > /tmp/vmstat_out.txt 2>&1 &
+              VPID=\$!
+              $cmd
+              # Let vmstat exit naturally so buffered output is flushed before extraction.
+              wait \$VPID 2>/dev/null
+              sync
+              echo '===VMSTAT_START===';
+              cat /tmp/vmstat_out.txt;
+              echo '===VMSTAT_END===';
+              }" > "$run_file" 2>&1
         local exit_code=$?
+
+        # Extract the vmstat output between the markers and save to a clean CSV file for analysis. If the file is empty after extraction, remove it.
+        sed -n '/===VMSTAT_START===/,/===VMSTAT_END===/{/===VMSTAT/d;p}' "$run_file" | \
+                normalize_vmstat_to_csv > "$vmstat_file"
+            [[ -s "$vmstat_file" ]] || rm -f "$vmstat_file"
+
+        sed -n '/===CSV_START===/,/===CSV_END===/{/===CSV/d;p}' "$run_file" | \
+                fix_QEMU_serial_log_format > "$cycles_file"
+            [[ -s "$cycles_file" ]] || rm -f "$cycles_file"
 
         if [[ $HICOM_MODE -eq 1 ]]; then
             # Wait for the "HICOM_PING_DONE run=N" marker to ensure the run has fully completed
@@ -406,12 +455,7 @@ run_experiment() {
                 echo "ERROR: Run $run did not complete successfully. Check console log."
                 continue
             fi
-
-            # Extract the console output for this run into the run file (overwriting the previous client-only output)
-            extract_run_results "$qemu_log" "$run" "$run_file"
-            
         fi
-
         if [[ $exit_code -ne 0 && $exit_code -ne 1 ]]; then
             # exit 1 means messages were lost — still a valid run, just noted
             echo "FAILED (exit code: $exit_code)"
@@ -429,16 +473,7 @@ run_experiment() {
                 echo "OK (lost: $lost, mean: ${mean_rtl} us, P99: ${p99_rtl} us)"
             fi
         fi
-
-        # Brief pause between runs — shm_echo remains running and ready
-        sleep 2
     done
-
-    # Retrieve stress-ng log before stopping QEMU
-    if [[ $n_workers -gt 0 ]]; then
-        echo "Retrieving stress-ng log..."
-        sshpass -p "$SSH_PASS" scp $SSH_OPTS -P "$SSH_PORT" "$SSH_USER@$SSH_HOST:/tmp/stressng_${name}.log" "$exp_dir/stressng.log" 2>/dev/null || true
-    fi
 
     # Stop stress-ng before tearing down QEMU.
     if [[ $n_workers -gt 0 ]]; then
@@ -446,6 +481,13 @@ run_experiment() {
         run_ssh "killall stress-ng 2>/dev/null || true"
         sleep 1
     fi
+
+    # Retrieve stress-ng log before stopping QEMU
+    if [[ $n_workers -gt 0 ]]; then
+        echo "Retrieving stress-ng log..."
+        sshpass -p "$SSH_PASS" scp $SSH_OPTS -P "$SSH_PORT" "$SSH_USER@$SSH_HOST:/tmp/stressng_${name}.log" "$exp_dir/stressng.log" 2>/dev/null || true
+    fi
+    sleep 1
 
     stop_qemu
 }

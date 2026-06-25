@@ -1,5 +1,5 @@
 /**
- * shm_ping_hi — HI-only ping-pong client (Scenario 2, hicom variant)
+ * hi_shm_ping — HI-only ping-pong client (Scenario 2, hicom variant)
  *
  * Runs as PID 1 on vm-hi.  Communicates with its child process (shm_echo_hi)
  * exclusively through the hicom shared memory region, which vm-li cannot access.
@@ -246,7 +246,7 @@ int main(int argc, char *argv[])
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc)
             n_messages = atoi(argv[++i]);
         else if (strcmp(argv[i], "-h") == 0) {
-            printf("Usage: shm_ping_hi [-n <count>]\n");
+            printf("Usage: hi_shm_ping [-n <count>]\n");
             printf("  -n <count>  Pings per run (default: %d, max: %d)\n",
                    DEFAULT_N_MESSAGES, MAX_SAMPLES);
             return 0;

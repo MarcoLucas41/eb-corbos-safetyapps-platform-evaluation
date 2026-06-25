@@ -8,9 +8,9 @@ function(target_enable_hi target)
   )
 endfunction()
 
-# Both shm_ping_hi (PID 1 / pinger) and shm_echo_hi (child / echo server)
+# Both hi_shm_ping (PID 1 / pinger) and hi_shm_echo (child / echo server)
 # are built here.  They share the same includes and shmlib dependency.
-foreach(bin shm_ping_hi shm_echo_hi)
+foreach(bin hi_shm_ping hi_shm_echo)
   add_executable(${bin} ${bin}.c)
 
   target_include_directories(${bin} PRIVATE
@@ -22,13 +22,13 @@ foreach(bin shm_ping_hi shm_echo_hi)
   )
 
   # shmlib: shared memory abstractions
-  # m:      libm for sqrt() in shm_ping_hi (harmless for shm_echo_hi)
+  # m:      libm for sqrt() in hi_shm_ping (harmless for hi_shm_echo)
   target_link_libraries(${bin} PRIVATE shmlib m)
 
   target_enable_hi(${bin})
 
   # Install to the hi VM root filesystem so the hypervisor can find them.
-  # shm_ping_hi is referenced by init= in the kernel cmdline.
-  # shm_echo_hi is exec'd by shm_ping_hi at runtime.
+  # hi_shm_ping is referenced by init= in the kernel cmdline.
+  # hi_shm_echo is exec'd by hi_shm_ping at runtime.
   install(TARGETS ${bin} DESTINATION /)
 endforeach()

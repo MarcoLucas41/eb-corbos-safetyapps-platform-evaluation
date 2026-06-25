@@ -18,7 +18,7 @@
 
 /* Timeout waiting for an echo response (milliseconds).
  * A ping is marked lost if no echo arrives within this window. */
-#define RTL_TIMEOUT_MS 500
+#define RTL_TIMEOUT_MS 10
 
 /* Payload size appended after the 16-byte header.
  * Can be overridden at CMake configure time via -DPING_PAYLOAD_BYTES=<N>

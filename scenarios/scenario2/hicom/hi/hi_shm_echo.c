@@ -1,5 +1,5 @@
 /**
- * shm_echo_hi — HI echo server (Scenario 2, hicom variant)
+ * hi_shm_echo — HI echo server (Scenario 2, hicom variant)
  *
  * Spawned as a child of shm_ping_hi via clone/execve.  Communicates
  * exclusively through the hicom shared memory region (vm-li has no access).
@@ -73,10 +73,10 @@ int main(void)
                        (unsigned long long)msg.seq, ret);
             } else {
                 echo_count++;
-                if (echo_count % 1000 == 0) {
-                    printf("[echo] %llu messages echoed\n",
-                           (unsigned long long)echo_count);
-                }
+                // if (echo_count % 1000 == 0) {
+                //     printf("[echo] %llu messages echoed\n",
+                //            (unsigned long long)echo_count);
+                // }
             }
         } else if (n == -EAGAIN) {
             nanosleep(&poll_sleep, NULL);

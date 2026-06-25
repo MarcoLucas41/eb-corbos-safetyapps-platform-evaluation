@@ -2,43 +2,51 @@
 """
 Scenario 2 Analysis — Inter-VM Communication Latency and Reliability
 
-Parses run_XX.txt files produced by s2_orchestrator.sh / s2hv_orchestrator.sh,
+Parses run_XX.txt files produced by s2_orchestrator.sh,
 prints summary tables, runs formal statistical tests, and generates plots for
-every hypothesis in the experiment design (H0-H5, H4 payload size).
+every hypothesis in the experiment design (H0-H4).
 
 Usage
 -----
-# Variant A only:
+# Configuration A only:
   python3 s2_plots.py -r results/2026-05-18_14:00
 
 # Filter to one stressor (recommended for N-trend analysis):
   python3 s2_plots.py -r results/2026-05-18_14:00 --stressor cache
 
-# Variant A + B cross-variant (H5):
+# Configuration A + B cross-configuration (H4):
   python3 s2_plots.py -r results/... --hicom-dir results_hicom/...
-
-# H4 payload size (secondary experiment):
-  python3 s2_plots.py -r results/... --h4-dir results_s2_h4
 
 Condition directory naming (from s2_orchestrator.sh):
   {stressor}_{n{workers}}   e.g.  baseline_n0  cache_n4  worst-case_n32
 
-H4 directory naming:
-  {size}B   e.g.  16B  64B  512B  3072B
 """
 
 import os
 import re
 import sys
+import csv
 import argparse
 from pathlib import Path
 
-# ─── Thresholds (scenario2_design.md §7) ──────────────────────────────────────
+# ─── Thresholds (scenario2_design.md) ──────────────────────────────────────
 
-DEGRADATION_P99_FACTOR    = 3.0   # H3 acceptance: P99 <= 3x baseline
-DEGRADATION_JITTER_FACTOR = 2.0   # H3 acceptance: jitter <= 2x baseline
-SPEARMAN_RHO_THRESHOLD    = 0.8   # |rho| > 0.8 to confirm H1
-ALPHA                     = 0.05  # significance level
+DEGRADATION_P99_FACTOR    = 3.0    # summary-table flag: P99 > 3x baseline
+DEGRADATION_JITTER_FACTOR = 2.0    # summary-table flag: jitter > 2x baseline
+ECHO_TIMEOUT_US           = 10_000 # 10 ms echo timeout in microseconds
+ALPHA                     = 0.05   # kept for reference; bootstrap CI uses CONF_LEVEL
+N_BOOT                    = 10_000 # bootstrap resamples
+CONF_LEVEL                = 0.99   # 99% CI — stricter false-positive control for SDV evaluation
+
+STRESSOR_ORDER = ["baseline", "cpu", "cache", "stream", "io", "worst-case"]
+STRESSOR_LABELS = {
+    "baseline":   "Baseline",
+    "cpu":        "CPU",
+    "cache":      "Cache",
+    "stream":     "Memory BW",
+    "io":         "I/O",
+    "worst-case": "Worst-case",
+}
 
 STRESSOR_PALETTE = {
     "baseline":   "#607D8B",
@@ -46,9 +54,6 @@ STRESSOR_PALETTE = {
     "cache":      "#FF9800",
     "stream":     "#4CAF50",
     "io":         "#9C27B0",
-    "shm":        "#00BCD4",
-    "vm":         "#795548",
-    "atomic":     "#E91E63",
     "worst-case": "#F44336",
 }
 FALLBACK_COLOR = "#333333"
@@ -73,17 +78,129 @@ def parse_run_file(path):
     _re(r"Messages sent:\s+(\d+)",                      int,   "n_sent")
     _re(r"Messages lost:\s+(\d+)",                      int,   "n_lost")
     _re(r"Messages lost:\s+\d+\s+\(([0-9.]+)%\)",       float, "loss_pct")
-    _re(r"Mean:\s+([0-9.]+)\s+Std dev:",                float, "rtl_mean_us")
-    _re(r"Mean:\s+[0-9.]+\s+Std dev:\s+([0-9.]+)",      float, "rtl_stddev_us")
-    _re(r"Min:\s+([0-9.]+)\s+Max:",                     float, "rtl_min_us")
-    _re(r"Min:\s+[0-9.]+\s+Max:\s+([0-9.]+)",           float, "rtl_max_us")
-    _re(r"P50:\s+([0-9.]+)\s+P95:",                     float, "rtl_p50_us")
-    _re(r"P50:\s+[0-9.]+\s+P95:\s+([0-9.]+)",           float, "rtl_p95_us")
-    _re(r"P99:\s+([0-9.]+)\s+P99\.9:",                  float, "rtl_p99_us")
-    _re(r"P99:\s+[0-9.]+\s+P99\.9:\s+([0-9.]+)",        float, "rtl_p999_us")
+    _re(r"Mean:\s+([0-9.]+)\s+Std dev:",                float, "rtt_mean_us")
+    _re(r"Mean:\s+[0-9.]+\s+Std dev:\s+([0-9.]+)",      float, "rtt_stddev_us")
+    _re(r"Min:\s+([0-9.]+)\s+Max:",                     float, "rtt_min_us")
+    _re(r"Min:\s+[0-9.]+\s+Max:\s+([0-9.]+)",           float, "rtt_max_us")
+    _re(r"P50:\s+([0-9.]+)\s+P95:",                     float, "rtt_p50_us")
+    _re(r"P50:\s+[0-9.]+\s+P95:\s+([0-9.]+)",           float, "rtt_p95_us")
+    _re(r"P99:\s+([0-9.]+)\s+P99\.9:",                  float, "rtt_p99_us")
+    _re(r"P99:\s+[0-9.]+\s+P99\.9:\s+([0-9.]+)",        float, "rtt_p999_us")
     _re(r"Throughput:\s+([0-9.]+)\s+msg/s",              float, "throughput")
 
     return s if s else None
+
+# Regex to strip ANSI escape codes and hypervisor serial mux prefixes
+# (e.g. "\x1b[37mvm-hi   | " added by L4/Fiasco.OC serial output)
+_ANSI_RE      = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+_VM_PREFIX_RE = re.compile(r"^vm-\S+\s*\|\s*")
+
+
+def _clean_serial_line(line):
+    """Remove ANSI codes and VM serial mux prefix from a line."""
+    line = _ANSI_RE.sub("", line)
+    line = _VM_PREFIX_RE.sub("", line)
+    return line
+
+def parse_cycles_csv(filepath):
+    """Parse a run_XX.csv file into lists of per-cycle data.
+
+    Handles raw lines that may contain ANSI escape codes and hypervisor
+    serial mux prefixes (e.g. from hi VM QEMU serial output).
+    """
+    rows = []
+    with open(filepath) as f:
+        reader = csv.DictReader(f)
+        for line in reader:
+            try:
+                rows.append({
+                    "Seq":    int(line["Seq"]),
+                    "RTT_ns": float(line["RTT_ns"]),
+                })
+            except (KeyError, ValueError) as e:
+                print(f"Skipping malformed row: {line} (error: {e})")
+                continue
+    return rows
+
+
+def parse_vmstat(filepath):
+    """Parse a vmstat output file into per-second rows.
+
+    Handles repeated headers that vmstat prints every ~20 lines.
+    Returns a list of dicts with vmstat columns plus 'timestamp_s'.
+    """
+    rows   = []
+    cols   = None
+    second = 0
+    try:
+        with open(filepath) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                # Detect column header line (contains us, sy, id)
+                if "us" in line and "sy" in line and "id" in line:
+                    cols = [c.strip() for c in re.split(r"[,\s]+", line) if c.strip()]
+                    continue
+                # Skip decoration lines (e.g. "procs ---memory--- ...")
+                if cols is None or not line[0].isdigit():
+                    continue
+                vals = [v.strip() for v in re.split(r"[,\s]+", line) if v.strip()]
+                if len(vals) != len(cols):
+                    continue
+                try:
+                    entry = {c: int(v) for c, v in zip(cols, vals)}
+                    entry["timestamp_s"] = float(second)
+                    rows.append(entry)
+                    second += 1
+                except ValueError:
+                    print(f"WARNING: Skipping malformed vmstat line: {line}")
+                    continue
+    except FileNotFoundError:
+        print(f"WARNING: vmstat file not found: {filepath}")
+        pass
+    return rows
+
+def load_timeseries(results_dir):
+    """Load per-cycle and vmstat data for every run in every condition.
+
+    Returns {condition_name: [(cycles_rows, vmstat_rows, speedom_vmstat_rows, run_num), ...]}.
+    Speedometer vmstat (run_XX_speedometer_vmstat.csv) is loaded when present;
+    an empty list is stored for runs where the file is absent.
+    """
+    ts_data = {}
+    for d in sorted(Path(results_dir).iterdir()):
+        if not d.is_dir() or d.name.startswith(".") or d.name == "plots":
+            continue
+        name = d.name
+        sep  = name.rfind("_")
+        # Accept both "baseline" (no suffix) and "cache_n4" (standard) formats
+        if sep != -1 and re.fullmatch(r"n\d+", name[sep + 1:]):
+            pass  # standard format
+        elif sep != -1:
+            continue  # has an underscore but not _n\d+ — skip
+        # else: bare name like "baseline" — accept with n_workers=0
+
+        run_entries = []
+        run_idx = 1
+        while True:
+            run_num   = f"{run_idx:02d}"
+            run_file  = d / f"run_{run_num}.txt"
+            if not run_file.exists():
+                break
+            cycles_file    = d / f"run_{run_num}.csv"
+            vmstat_file    = d / f"run_{run_num}_vmstat.csv"
+            speedom_file   = d / f"run_{run_num}_speedometer_vmstat.csv"
+            cycles         = parse_cycles_csv(cycles_file) if cycles_file.exists() else []
+            vmstat         = parse_vmstat(vmstat_file)     if vmstat_file.exists() else []
+            speedom_vmstat = parse_vmstat(speedom_file)    if speedom_file.exists() else []
+            run_entries.append((cycles, vmstat, speedom_vmstat, run_num))
+            run_idx += 1
+
+        if run_entries:
+            ts_data[name] = run_entries
+
+    return ts_data
 
 
 def discover_conditions(results_dir):
@@ -107,13 +224,14 @@ def discover_conditions(results_dir):
             continue
         name = d.name
         sep  = name.rfind("_")
-        if sep == -1:
-            continue
-        stressor   = name[:sep]
-        worker_key = name[sep + 1:]
-        if not re.fullmatch(r"n\d+", worker_key):
-            continue
-        n_workers = int(worker_key[1:])
+        if sep != -1 and re.fullmatch(r"n\d+", name[sep + 1:]):
+            # Standard format: {stressor}_n{workers}  e.g. cache_n4
+            stressor  = name[:sep]
+            n_workers = int(name[sep + 1:][1:])
+        else:
+            # Bare stressor name with no worker suffix  e.g. "baseline"
+            stressor  = name
+            n_workers = 0
 
         runs = [parse_run_file(f) for f in sorted(d.glob("run_*.txt"))]
         runs = [r for r in runs if r]
@@ -125,28 +243,6 @@ def discover_conditions(results_dir):
             }
 
     return conditions
-
-
-def load_h4_results(h4_dir):
-    """
-    Load H4 payload-size results.
-    Expected: h4_dir/{N}B/run_XX.txt   e.g. 16B/ 64B/ 512B/ 3072B/
-
-    Returns dict[payload_bytes_int] = list[run_dict]
-    """
-    results = {}
-    for d in sorted(Path(h4_dir).iterdir()):
-        if not d.is_dir():
-            continue
-        m = re.fullmatch(r"(\d+)[Bb]", d.name)
-        if not m:
-            continue
-        payload = int(m.group(1))
-        runs    = [parse_run_file(f) for f in sorted(d.glob("run_*.txt"))]
-        runs    = [r for r in runs if r]
-        if runs:
-            results[payload] = runs
-    return results
 
 # ─── Condition helpers ────────────────────────────────────────────────────────
 
@@ -162,8 +258,11 @@ def for_stressor(conditions, stressor, include_baseline=True):
     Prepends baseline_n0 as the N=0 anchor unless stressor == 'baseline'.
     """
     sel = {k: v for k, v in conditions.items() if v["stressor"] == stressor}
-    if include_baseline and stressor != "baseline" and "baseline_n0" in conditions:
-        sel = {"baseline_n0": conditions["baseline_n0"], **sel}
+    if include_baseline and stressor != "baseline":
+        baseline_items = {k: v for k, v in conditions.items()
+                          if v["stressor"] == "baseline"}
+        if baseline_items:
+            sel = {**baseline_items, **sel}
     return dict(sorted(sel.items(), key=lambda x: x[1]["n_workers"]))
 
 # ─── Aggregation helpers ──────────────────────────────────────────────────────
@@ -199,8 +298,8 @@ def print_summary_table(conditions, label=""):
     print("=" * W)
     print(
         f"  {'Condition':<24} {'Stressor':<12} {'N':>5} {'Runs':>4} "
-        f"{'Lost%':>6}  {'MeanRTL':>9} {'StdDev':>8} "
-        f"{'P99':>9} {'P99.9':>9} {'MaxRTL':>9} {'Thput':>7}"
+        f"{'Lost%':>6}  {'MeanRTT':>9} {'StdDev':>8} "
+        f"{'P99':>9} {'P99.9':>9} {'MaxRTT':>9} {'Thput':>7}"
     )
     print("-" * W)
 
@@ -213,11 +312,11 @@ def print_summary_table(conditions, label=""):
         total_lost = sum(r.get("n_lost", 0) for r in runs)
         loss_pct   = total_lost / total_sent * 100 if total_sent else 0.0
 
-        avg_mean  = _avg(runs, "rtl_mean_us")
-        avg_std   = _avg(runs, "rtl_stddev_us")
-        avg_p99   = _avg(runs, "rtl_p99_us")
-        avg_p999  = _avg(runs, "rtl_p999_us")
-        worst_max = max(_vals(runs, "rtl_max_us"), default=0.0)
+        avg_mean  = _avg(runs, "rtt_mean_us")
+        avg_std   = _avg(runs, "rtt_stddev_us")
+        avg_p99   = _avg(runs, "rtt_p99_us")
+        avg_p999  = _avg(runs, "rtt_p999_us")
+        worst_max = max(_vals(runs, "rtt_max_us"), default=0.0)
         avg_tput  = _avg(runs, "throughput")
 
         if name == "baseline_n0":
@@ -239,7 +338,7 @@ def print_summary_table(conditions, label=""):
         )
 
     print("=" * W)
-    print("  RTL in µs.  Throughput in msg/s.")
+    print("  RTT in µs.  Throughput in msg/s.")
     if baseline_p99:
         print(f"  P99! = P99 > {DEGRADATION_P99_FACTOR}x baseline "
               f"({baseline_p99:.1f} µs threshold: {baseline_p99 * DEGRADATION_P99_FACTOR:.1f} µs)")
@@ -247,147 +346,211 @@ def print_summary_table(conditions, label=""):
         print(f"  J!   = jitter > {DEGRADATION_JITTER_FACTOR}x baseline "
               f"({baseline_jitter:.1f} µs threshold: {baseline_jitter * DEGRADATION_JITTER_FACTOR:.1f} µs)")
 
-# ─── Statistical tests ────────────────────────────────────────────────────────
-
-def _scipy():
-    try:
-        from scipy import stats
-        return stats
-    except ImportError:
-        return None
+# ─── Statistical tests ────────────────────────────────────────────────────────────────
 
 
-def test_per_variant(conditions, label=""):
+def run_statistical_tests(conditions, label=""):
+    """Hypothesis tests using P99.9 RTT and bootstrap 99% CIs.
+
+    Metric: rtt_p999_us per run.
+
+    H0: P99.9 RTT distributions identical across stressor types
+        → bootstrap CI on median P99.9; non-overlapping CIs reject H0.
+    H1: At least one stressor causes a significant increase in P99.9 RTT vs baseline
+        → bootstrap CI on ΔRTT_P99.9; CI excluding zero ⇒ significant.
+    H2: CPU/Cache ΔRTT_P99.9 > Memory/IO ΔRTT_P99.9
+        → bootstrap CI on (ΔRTT_cpu/cache − ΔRTT_mem/io); CI > 0 ⇒ supported.
+    Compliance check: worst P99.9 RTT vs 10 ms echo timeout.
     """
-    H0:  Kruskal-Wallis — load has no significant effect on RTL.
-    H1:  Spearman rho  — mean RTL and jitter increase monotonically with N.
-    H2:  P99.9/mean ratio trend — tail grows faster than mean.
+    # Pool all runs per stressor type across N levels
+    stressor_runs = {}
+    for cond in conditions.values():
+        stressor_runs.setdefault(cond["stressor"], []).extend(cond["runs"])
 
-    Prints results; returns dict for downstream use.
+    baseline_runs  = stressor_runs.get("baseline", [])
+    baseline_p999  = _vals(baseline_runs, "rtt_p999_us")
+    stressed_types = sorted(st for st in stressor_runs if st != "baseline")
+
+    print("\n" + "=" * 80)
+    print(f"STATISTICAL HYPOTHESIS TESTS  [P99.9 RTT + Bootstrap {CONF_LEVEL*100:.0f}% CI]"
+          f"{('  —  ' + label) if label else ''}")
+    print(f"  Metric : rtt_p999_us per run")
+    print(f"  Method : percentile bootstrap  (N_boot = {N_BOOT:,},  CI = {CONF_LEVEL*100:.0f}%)")
+    print("=" * 80)
+
+    # ── H0: Bootstrap CI on median P99.9 per stressor ──────────────────────────
+    print("\n--- H₀: P99.9 RTT distributions across stressor types ---")
+    print(f"  {'Stressor':<16} {'Runs':>5}  {'Median P99.9':>14}  {f'{CONF_LEVEL*100:.0f}% CI':>26}  Overlaps baseline?")
+    print(f"  {'-' * 80}")
+
+    bl_ci    = None
+    p999_cis = {}
+    for st in ["baseline"] + stressed_types:
+        runs      = stressor_runs.get(st, [])
+        p999_vals = _vals(runs, "rtt_p999_us")
+        lbl       = STRESSOR_LABELS.get(st, st)
+        if len(p999_vals) < 2:
+            print(f"  {lbl:<16} {'':>5}  insufficient data")
+            continue
+        lo, hi, med = _bootstrap_ci_single(p999_vals)
+        p999_cis[st] = (lo, hi, med)
+        if st == "baseline":
+            bl_ci  = (lo, hi, med)
+            status = "  (reference)"
+        elif bl_ci:
+            overlaps = not (lo > bl_ci[1] or hi < bl_ci[0])
+            status   = "  ✓ overlaps" if overlaps else "  ✗ no overlap  *"
+        else:
+            status = ""
+        print(f"  {lbl:<16} {len(p999_vals):>5}  {med:>11.1f} µs    "
+              f"[{lo:>8.1f},  {hi:>8.1f}] µs  {status}")
+
+    if bl_ci:
+        rejected = [STRESSOR_LABELS.get(st, st) for st in stressed_types
+                    if st in p999_cis and
+                    (p999_cis[st][0] > bl_ci[1] or p999_cis[st][1] < bl_ci[0])]
+        print()
+        if rejected:
+            print(f"  H₀ REJECTED: non-overlapping CI vs baseline → {', '.join(rejected)}")
+        else:
+            print("  H₀ NOT REJECTED: all stressor P99.9 CIs overlap with baseline")
+
+    # ── H1: Bootstrap CI on ΔRTT_P99.9 per stressor ─────────────────────────
+    print(f"\n--- H₁: ΔRTT_P99.9 vs baseline  (bootstrap {CONF_LEVEL*100:.0f}% CI) ---")
+    print(f"  Significant (*) if CI excludes zero (lo > 0)\n")
+    print(f"  {'Stressor':<16} {'ΔRTT_P99.9':>12}  {f'{CONF_LEVEL*100:.0f}% CI':>28}  Sig")
+    print(f"  {'-' * 63}")
+
+    for st in stressed_types:
+        p999_st = _vals(stressor_runs[st], "rtt_p999_us")
+        lbl     = STRESSOR_LABELS.get(st, st)
+        if len(baseline_p999) < 2 or len(p999_st) < 2:
+            print(f"  {lbl:<16} insufficient data")
+            continue
+        lo, hi, delta = _bootstrap_ci_difference(baseline_p999, p999_st)
+        sig = "*" if lo > 0 else ("" if hi > 0 else "✗ negative")
+        print(f"  {lbl:<16} {delta:>+11.1f}µs   [{lo:>+10.1f},  {hi:>+10.1f}]µs  {sig}")
+
+    # ── H2: CPU/Cache ΔRTT vs Memory/IO ΔRTT ─────────────────────────────
+    print("\n--- H₂: CPU/Cache ΔRTT_P99.9 vs Memory/IO ΔRTT_P99.9 ---")
+    print("  Test: bootstrap CI on (ΔRTT_cpu/cache − ΔRTT_mem/io)")
+    print("  H₂ SUPPORTED if CI excludes zero and is positive\n")
+
+    cc_runs = [r for st in ["cpu", "cache"] if st in stressor_runs
+               for r in stressor_runs[st]]
+    mi_runs = [r for st in ["stream", "io"] if st in stressor_runs
+               for r in stressor_runs[st]]
+    cc_p999 = _vals(cc_runs, "rtt_p999_us")
+    mi_p999 = _vals(mi_runs, "rtt_p999_us")
+
+    if len(cc_p999) >= 2 and len(mi_p999) >= 2 and len(baseline_p999) >= 2:
+        lo_cc, hi_cc, d_cc = _bootstrap_ci_difference(baseline_p999, cc_p999)
+        lo_mi, hi_mi, d_mi = _bootstrap_ci_difference(baseline_p999, mi_p999)
+        lo,    hi,    diff = _bootstrap_ci_difference(mi_p999, cc_p999)
+        print(f"  ΔRTT_P99.9 CPU/Cache : {d_cc:>+.1f}µs   [{lo_cc:>+.1f},  {hi_cc:>+.1f}]")
+        print(f"  ΔRTT_P99.9 Mem/IO    : {d_mi:>+.1f}µs   [{lo_mi:>+.1f},  {hi_mi:>+.1f}]")
+        print(f"  Difference           : {diff:>+.1f}µs   [{lo:>+.1f},  {hi:>+.1f}]")
+        if lo > 0:
+            print("  H₂ SUPPORTED: CPU/cache cause significantly larger P99.9 RTT increase.")
+        elif hi < 0:
+            print("  H₂ NOT SUPPORTED: Memory/IO cause larger P99.9 RTT increase.")
+        else:
+            print("  H₂ INCONCLUSIVE: CI includes zero.")
+    else:
+        print("  Insufficient data for one or both stressor groups.")
+
+    # ── Compliance check: worst P99.9 RTT vs echo timeout ────────────────────
+    print(f"\n--- Compliance check: P99.9 RTT vs echo timeout ({ECHO_TIMEOUT_US/1000:.0f} ms) ---")
+    all_p999 = [(cname, max(_vals(cond["runs"], "rtt_p999_us"), default=0.0))
+                for cname, cond in conditions.items()]
+    if all_p999:
+        worst_name, worst_val = max(all_p999, key=lambda x: x[1])
+        margin = (ECHO_TIMEOUT_US - worst_val) / ECHO_TIMEOUT_US * 100
+        print(f"  Worst P99.9 RTT : {worst_val:.1f} µs  ({worst_name})")
+        print(f"  Echo timeout    : {ECHO_TIMEOUT_US:.0f} µs  ({ECHO_TIMEOUT_US/1000:.0f} ms)")
+        print(f"  Safety margin   : {margin:.1f}%")
+        if worst_val <= ECHO_TIMEOUT_US:
+            print("  All P99.9 RTTs within echo timeout.")
+        else:
+            print(f"  TIMEOUT EXCEEDED: P99.9 RTT exceeds timeout by {worst_val - ECHO_TIMEOUT_US:.1f} µs.")
+
+    print("=" * 80)
+
+
+def test_cross_configuration(proxy_conds, hicom_conds, stressor):
+    """H3: ΔRTT_P99.9 caused by stressor is significantly greater in Config A
+    (proxycomshm, through LI VM) than in Config B (hicom, HI-only channel).
+
+    Uses _bootstrap_ci_delta_diff on four independent P99.9 RTT sample pools.
+    H3 confirmed if 99% CI on (ΔRTT_A − ΔRTT_B) is positive (excludes zero).
+    Also reports per-N direct P99.9 comparison with bootstrap CI.
     """
-    sp = _scipy()
-    sep = "─" * 62
+    sep = "─" * 72
     print(f"\n{sep}")
-    print(f"  Statistical Tests{('  —  ' + label) if label else ''}")
+    print(f"  Cross-Configuration Tests (H3)  [Bootstrap {CONF_LEVEL*100:.0f}% CI]  —  stressor: {stressor}")
     print(sep)
 
-    sc      = sorted(conditions.values(), key=lambda x: x["n_workers"])
-    n_vals  = [c["n_workers"]                  for c in sc]
-    means   = [_avg(c["runs"], "rtl_mean_us")  for c in sc]
-    jitters = [_avg(c["runs"], "rtl_stddev_us") for c in sc]
-    p999s   = [_avg(c["runs"], "rtl_p999_us")  for c in sc]
-    groups  = [_vals(c["runs"], "rtl_mean_us") for c in sc]
-    groups  = [g for g in groups if len(g) >= 2]
+    # Separate stressor and baseline runs for each config
+    proxy_stress_runs = [r for cond in proxy_conds.values()
+                         if cond["stressor"] != "baseline" for r in cond["runs"]]
+    proxy_base_runs   = [r for cond in proxy_conds.values()
+                         if cond["stressor"] == "baseline" for r in cond["runs"]]
+    hicom_stress_runs = [r for cond in hicom_conds.values()
+                         if cond["stressor"] != "baseline" for r in cond["runs"]]
+    hicom_base_runs   = [r for cond in hicom_conds.values()
+                         if cond["stressor"] == "baseline" for r in cond["runs"]]
 
-    out = {}
+    p_st = _vals(proxy_stress_runs, "rtt_p999_us")
+    p_bl = _vals(proxy_base_runs,   "rtt_p999_us")
+    h_st = _vals(hicom_stress_runs, "rtt_p999_us")
+    h_bl = _vals(hicom_base_runs,   "rtt_p999_us")
 
-    if not sp:
-        print("  [scipy not available — pip3 install scipy]")
-        return out
+    result = {}
 
-    # H0: Kruskal-Wallis
-    if len(groups) >= 2:
-        kw_h, kw_p = sp.kruskal(*groups)
-        verdict = ("H0 REJECTED  [load has significant effect]"
-                   if kw_p < ALPHA
-                   else "H0 not rejected  (no significant effect detected)")
-        print(f"  Kruskal-Wallis:       H = {kw_h:.3f},  p = {kw_p:.4f}")
-        print(f"    -> {verdict}")
-        out["kruskal"] = {"H": kw_h, "p": kw_p}
+    # ─ H3: ΔRTT_proxy − ΔRTT_hicom ────────────────────────────────────────────
+    print(f"\n  H3: ΔRTT_P99.9_proxy − ΔRTT_P99.9_hicom  (bootstrap {CONF_LEVEL*100:.0f}% CI)")
+    print("  H3 confirmed if CI > 0  (proxycomshm more affected than hicom)\n")
 
-    # H1: Spearman rho
-    if len(n_vals) >= 3:
-        rho_m, p_m = sp.spearmanr(n_vals, means)
-        rho_j, p_j = sp.spearmanr(n_vals, jitters)
-        h1_ok = abs(rho_m) >= SPEARMAN_RHO_THRESHOLD and p_m < ALPHA
-        print(f"  Spearman rho (mean):  rho = {rho_m:+.3f},  p = {p_m:.4f}"
-              f"  ->  {'H1 CONFIRMED' if h1_ok else 'H1 not confirmed'}")
-        print(f"  Spearman rho (jitter):rho = {rho_j:+.3f},  p = {p_j:.4f}")
-        out["spearman_mean"]   = {"rho": rho_m, "p": p_m}
-        out["spearman_jitter"] = {"rho": rho_j, "p": p_j}
+    lo, hi, pt = _bootstrap_ci_delta_diff(p_st, p_bl, h_st, h_bl)
+    if lo == lo:   # not nan
+        d_p = (sum(p_st) / len(p_st) - sum(p_bl) / len(p_bl)) \
+              if p_st and p_bl else float("nan")
+        d_h = (sum(h_st) / len(h_st) - sum(h_bl) / len(h_bl)) \
+              if h_st and h_bl else float("nan")
+        print(f"  ΔRTT_P99.9 proxy : {d_p:>+.1f} µs")
+        print(f"  ΔRTT_P99.9 hicom : {d_h:>+.1f} µs")
+        print(f"  ΔΔRTT (proxy−hicom): {pt:>+.1f} µs   {CONF_LEVEL*100:.0f}% CI [{lo:>+.1f},  {hi:>+.1f}] µs")
+        if lo > 0:
+            print("  H3 CONFIRMED: proxycomshm significantly more affected than hicom.")
+        elif hi < 0:
+            print("  H3 REJECTED: hicom unexpectedly more affected than proxycomshm.")
+        else:
+            print("  H3 INCONCLUSIVE: CI includes zero.")
+        result["delta_diff"] = {"lo": lo, "hi": hi, "pt": pt}
+    else:
+        print("  Insufficient data for H3 test.")
 
-        lr   = sp.linregress(n_vals, means)
-        ci95 = 1.96 * lr.stderr
-        print(f"  Linear slope:         {lr.slope:.3f} +/- {ci95:.3f} µs/worker"
-              f"  (R2 = {lr.rvalue**2:.3f},  p = {lr.pvalue:.4f})")
-        out["slope"] = {"slope": lr.slope, "ci": ci95,
-                        "r2": lr.rvalue ** 2, "p": lr.pvalue}
-
-    # H2: P99.9/mean ratio trend
-    ratios   = [p / m if m > 0 else 0.0 for p, m in zip(p999s, means)]
-    monotone = all(ratios[i] <= ratios[i + 1] for i in range(len(ratios) - 1))
-    print(f"  P99.9/mean ratios:    {[round(r, 2) for r in ratios]}")
-    print(f"    -> H2 {'CONFIRMED  [ratio grows monotonically]' if monotone else 'not confirmed (non-monotone)'}")
-    out["tail_ratios"] = {"ratios": ratios, "n_vals": n_vals, "monotone": monotone}
-
-    return out
-
-
-def test_cross_variant(proxy_conds, hicom_conds, stressor):
-    """
-    H5:  Wilcoxon on per-condition medians — hicom less affected than proxy.
-    H5a: Kruskal-Wallis on hicom alone — load has no effect on hicom RTL.
-    Plus slope comparison with 95% CIs.
-    """
-    sp  = _scipy()
-    sep = "─" * 62
-    print(f"\n{sep}")
-    print(f"  Cross-Variant Tests (H5)  —  stressor: {stressor}")
-    print(sep)
+    # ─ Direct P99.9 comparison per N ──────────────────────────────────────
+    print(f"\n  Direct P99.9 RTT comparison per N  (bootstrap {CONF_LEVEL*100:.0f}% CI on proxy − hicom)")
+    print(f"  {'N':>5}  {'Proxy P99.9':>12}  {'hicom P99.9':>12}  {'Proxy−hicom':>12}  {f'{CONF_LEVEL*100:.0f}% CI':>24}  Sig")
+    print(f"  {'-' * 75}")
 
     proxy_by_n = {v["n_workers"]: v for v in proxy_conds.values()}
     hicom_by_n = {v["n_workers"]: v for v in hicom_conds.values()}
-    common_n   = sorted(set(proxy_by_n) & set(hicom_by_n))
-    out = {"common_n": common_n}
+    for n in sorted(set(proxy_by_n) & set(hicom_by_n)):
+        pv = _vals(proxy_by_n[n]["runs"], "rtt_p999_us")
+        hv = _vals(hicom_by_n[n]["runs"], "rtt_p999_us")
+        p_med = sorted(pv)[len(pv) // 2] if pv else float("nan")
+        h_med = sorted(hv)[len(hv) // 2] if hv else float("nan")
+        if len(pv) >= 2 and len(hv) >= 2:
+            lo_n, hi_n, pt_n = _bootstrap_ci_difference(hv, pv)  # proxy - hicom
+            sig = "*" if lo_n > 0 else ""
+            print(f"  {n:>5}  {p_med:>11.1f}µs  {h_med:>11.1f}µs  {pt_n:>+11.1f}µs  "
+                  f"[{lo_n:>+9.1f},  {hi_n:>+9.1f}]µs  {sig}")
+        else:
+            print(f"  {n:>5}  insufficient data")
 
-    if len(common_n) < 3:
-        print("  [< 3 overlapping N values — tests skipped]")
-        return out
-
-    p_meds  = [_median(proxy_by_n[n]["runs"], "rtl_mean_us") for n in common_n]
-    h_meds  = [_median(hicom_by_n[n]["runs"],  "rtl_mean_us") for n in common_n]
-    p_means = [_avg(proxy_by_n[n]["runs"],     "rtl_mean_us") for n in common_n]
-    h_means = [_avg(hicom_by_n[n]["runs"],     "rtl_mean_us") for n in common_n]
-
-    if not sp:
-        print("  [scipy not available — pip3 install scipy]")
-        return out
-
-    # Wilcoxon
-    wil_s, wil_p = sp.wilcoxon(p_meds, h_meds)
-    h5_ok = wil_p < ALPHA
-    print(f"  Wilcoxon (medians):   W = {wil_s:.1f},  p = {wil_p:.4f}")
-    print(f"    -> H5 {'CONFIRMED  [variants differ significantly]' if h5_ok else 'not confirmed (no significant difference)'}")
-    out["wilcoxon"] = {"W": wil_s, "p": wil_p}
-
-    # Slope comparison with 95% CIs
-    lr_p  = sp.linregress(common_n, p_means)
-    lr_h  = sp.linregress(common_n, h_means)
-    ci_p  = 1.96 * lr_p.stderr
-    ci_h  = 1.96 * lr_h.stderr
-    overlap = not (
-        lr_p.slope - ci_p > lr_h.slope + ci_h or
-        lr_h.slope - ci_h > lr_p.slope + ci_p
-    )
-    print(f"  Proxy slope:          {lr_p.slope:.3f} +/- {ci_p:.3f} µs/worker")
-    print(f"  hicom slope:          {lr_h.slope:.3f} +/- {ci_h:.3f} µs/worker")
-    print(f"    -> {'H5 CONFIRMED by slope  [non-overlapping 95% CIs]' if not overlap else 'slope CIs overlap — inconclusive'}")
-    out["slopes"] = {
-        "proxy": {"slope": lr_p.slope, "ci": ci_p, "r2": lr_p.rvalue ** 2},
-        "hicom": {"slope": lr_h.slope, "ci": ci_h, "r2": lr_h.rvalue ** 2},
-    }
-
-    # H5a: Kruskal on hicom only
-    h_groups = [_vals(hicom_by_n[n]["runs"], "rtl_mean_us") for n in common_n]
-    h_groups = [g for g in h_groups if len(g) >= 2]
-    if len(h_groups) >= 2:
-        kw_h, kw_p = sp.kruskal(*h_groups)
-        h5a_ok = kw_p >= ALPHA
-        print(f"  hicom Kruskal-Wallis: H = {kw_h:.3f},  p = {kw_p:.4f}")
-        print(f"    -> H5a {'CONFIRMED  [hicom unaffected by load]' if h5a_ok else 'REJECTED  (hicom RTL changes with load)'}")
-        out["hicom_kruskal"] = {"H": kw_h, "p": kw_p}
-
-    return out
+    return result
 
 # ─── Plot helpers ─────────────────────────────────────────────────────────────
 
@@ -400,13 +563,91 @@ def _sorted_sc(conditions):
     sc = sorted(conditions.values(), key=lambda x: x["n_workers"])
     return [c["n_workers"] for c in sc], sc
 
-# ─── Per-variant plots ────────────────────────────────────────────────────────
+# ─── Bootstrap CI helpers ────────────────────────────────────────────────
 
-def plot_mean_rtl(conditions, out, stressor, suffix=""):
+
+def _bootstrap_ci_single(vals, n_boot=N_BOOT, ci=CONF_LEVEL):
+    """Bootstrap CI on the median of a single sample (percentile method).
+    Returns (ci_lower, ci_upper, point_median). No scipy/numpy required.
+    """
+    import random as _rng
+    n = len(vals)
+    if n < 2:
+        pt = vals[0] if n == 1 else float("nan")
+        return float("nan"), float("nan"), pt
+    boot = []
+    for _ in range(n_boot):
+        s = sorted(_rng.choices(vals, k=n))
+        m = n // 2
+        boot.append(s[m] if n % 2 else (s[m - 1] + s[m]) / 2.0)
+    boot.sort()
+    alpha = (1.0 - ci) / 2.0
+    lo = boot[max(0, int(n_boot * alpha))]
+    hi = boot[min(n_boot - 1, int(n_boot * (1.0 - alpha)))]
+    s  = sorted(vals)
+    m  = n // 2
+    pt = s[m] if n % 2 else (s[m - 1] + s[m]) / 2.0
+    return lo, hi, pt
+
+
+def _bootstrap_ci_difference(a_vals, b_vals, n_boot=N_BOOT, ci=CONF_LEVEL):
+    """Bootstrap CI on mean(b) - mean(a) for two independent samples.
+    Returns (ci_lower, ci_upper, point_estimate).
+    CI excludes zero from below (lo > 0) ⇒ b significantly greater than a.
+    """
+    import random as _rng
+    na, nb = len(a_vals), len(b_vals)
+    if na < 2 or nb < 2:
+        return float("nan"), float("nan"), float("nan")
+    boot = []
+    for _ in range(n_boot):
+        sa = _rng.choices(a_vals, k=na)
+        sb = _rng.choices(b_vals, k=nb)
+        boot.append(sum(sb) / nb - sum(sa) / na)
+    boot.sort()
+    alpha = (1.0 - ci) / 2.0
+    lo = boot[max(0, int(n_boot * alpha))]
+    hi = boot[min(n_boot - 1, int(n_boot * (1.0 - alpha)))]
+    pt = sum(b_vals) / nb - sum(a_vals) / na
+    return lo, hi, pt
+
+
+def _bootstrap_ci_delta_diff(a_stress, a_base, b_stress, b_base,
+                              n_boot=N_BOOT, ci=CONF_LEVEL):
+    """Bootstrap CI on (ΔRTT_A − ΔRTT_B) from four independent samples.
+    ΔRTT_X = mean(stress_X) − mean(base_X).
+    Returns (ci_lower, ci_upper, point_estimate).
+    CI > 0 means Config A more affected by the stressor than Config B (H3).
+    """
+    import random as _rng
+    na_s, na_b = len(a_stress), len(a_base)
+    nb_s, nb_b = len(b_stress), len(b_base)
+    if min(na_s, na_b, nb_s, nb_b) < 2:
+        return float("nan"), float("nan"), float("nan")
+    boot = []
+    for _ in range(n_boot):
+        sas = _rng.choices(a_stress, k=na_s)
+        sab = _rng.choices(a_base,   k=na_b)
+        sbs = _rng.choices(b_stress, k=nb_s)
+        sbb = _rng.choices(b_base,   k=nb_b)
+        d_a = sum(sas) / na_s - sum(sab) / na_b
+        d_b = sum(sbs) / nb_s - sum(sbb) / nb_b
+        boot.append(d_a - d_b)
+    boot.sort()
+    alpha = (1.0 - ci) / 2.0
+    lo = boot[max(0, int(n_boot * alpha))]
+    hi = boot[min(n_boot - 1, int(n_boot * (1.0 - alpha)))]
+    pt = (sum(a_stress) / na_s - sum(a_base) / na_b) - \
+         (sum(b_stress) / nb_s - sum(b_base) / nb_b)
+    return lo, hi, pt
+
+# ─── Per-configuration plots ────────────────────────────────────────────────────────
+
+def plot_mean_rtt(conditions, out, stressor, suffix=""):
     import matplotlib.pyplot as plt
     n_vals, sc = _sorted_sc(conditions)
-    means  = [_avg(c["runs"], "rtl_mean_us")             for c in sc]
-    errs   = [_std_across_runs(c["runs"], "rtl_mean_us") for c in sc]
+    means  = [_avg(c["runs"], "rtt_mean_us")             for c in sc]
+    errs   = [_std_across_runs(c["runs"], "rtt_mean_us") for c in sc]
     color  = STRESSOR_PALETTE.get(stressor, FALLBACK_COLOR)
 
     fig, ax = plt.subplots(figsize=(9, 5))
@@ -414,54 +655,33 @@ def plot_mean_rtl(conditions, out, stressor, suffix=""):
                 color=color, linewidth=2, markersize=7,
                 label="mean ± cross-run std")
     ax.set_xlabel("Background Workers on vm-li (N)")
-    ax.set_ylabel("Mean RTL (µs)")
-    ax.set_title(f"Mean RTL vs Load — {stressor}  (H1)")
+    ax.set_ylabel("Mean RTT (µs)")
+    ax.set_title(f"Mean RTT vs Load — {stressor}  (H1)")
     ax.set_xticks(n_vals); ax.legend(); ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
-    _save(fig, os.path.join(out, f"rtl_mean{suffix}.png"))
+    _save(fig, os.path.join(out, f"rtt_mean{suffix}.png"))
     plt.close(fig)
 
 
 def plot_percentiles(conditions, out, stressor, suffix=""):
     import matplotlib.pyplot as plt
     n_vals, sc = _sorted_sc(conditions)
-    p50s  = [_avg(c["runs"], "rtl_p50_us")  for c in sc]
-    p99s  = [_avg(c["runs"], "rtl_p99_us")  for c in sc]
-    p999s = [_avg(c["runs"], "rtl_p999_us") for c in sc]
+    p50s  = [_avg(c["runs"], "rtt_p50_us")  for c in sc]
+    p95s  = [_avg(c["runs"], "rtt_p95_us")  for c in sc]
+    p99s  = [_avg(c["runs"], "rtt_p99_us")  for c in sc]
+    p999s = [_avg(c["runs"], "rtt_p999_us") for c in sc]
 
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.plot(n_vals, p50s,  "o-", label="P50",   color="#4CAF50", linewidth=2)
+    ax.plot(n_vals, p95s,  "D-", label="P95",   color="#2196F3", linewidth=2)
     ax.plot(n_vals, p99s,  "s-", label="P99",   color="#FF9800", linewidth=2)
     ax.plot(n_vals, p999s, "^-", label="P99.9", color="#F44336", linewidth=2)
     ax.set_xlabel("Background Workers on vm-li (N)")
-    ax.set_ylabel("RTL (µs)")
-    ax.set_title(f"RTL Percentiles vs Load — {stressor}  (H2)")
+    ax.set_ylabel("RTT (µs)")
+    ax.set_title(f"RTT Percentiles vs Load — {stressor}  (H1/H2)")
     ax.set_xticks(n_vals); ax.legend(); ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
-    _save(fig, os.path.join(out, f"rtl_percentiles{suffix}.png"))
-    plt.close(fig)
-
-
-def plot_tail_ratio(conditions, out, stressor, suffix=""):
-    """P99.9/mean ratio per condition — direct evidence for H2."""
-    import matplotlib.pyplot as plt
-    n_vals, sc = _sorted_sc(conditions)
-    means  = [_avg(c["runs"], "rtl_mean_us")  for c in sc]
-    p999s  = [_avg(c["runs"], "rtl_p999_us")  for c in sc]
-    ratios = [p / m if m > 0 else 0.0 for p, m in zip(p999s, means)]
-    color  = STRESSOR_PALETTE.get(stressor, FALLBACK_COLOR)
-
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(n_vals, ratios, "o-", color=color, linewidth=2, markersize=7)
-    if ratios:
-        ax.axhline(ratios[0], linestyle="--", color="grey", alpha=0.6,
-                   label=f"Baseline ratio ({ratios[0]:.1f})")
-    ax.set_xlabel("Background Workers on vm-li (N)")
-    ax.set_ylabel("P99.9 / Mean RTL")
-    ax.set_title(f"Tail Growth Ratio vs Load — {stressor}  (H2: should increase)")
-    ax.set_xticks(n_vals); ax.legend(); ax.grid(axis="y", alpha=0.3)
-    fig.tight_layout()
-    _save(fig, os.path.join(out, f"tail_ratio{suffix}.png"))
+    _save(fig, os.path.join(out, f"rtt_percentiles{suffix}.png"))
     plt.close(fig)
 
 
@@ -469,20 +689,20 @@ def plot_boxplot(conditions, out, stressor, suffix=""):
     import matplotlib.pyplot as plt
     n_vals, sc = _sorted_sc(conditions)
     labels   = [str(n) for n in n_vals]
-    box_data = [_vals(c["runs"], "rtl_mean_us") for c in sc]
+    box_data = [_vals(c["runs"], "rtt_mean_us") for c in sc]
     colors   = (["#607D8B"] +
                 [STRESSOR_PALETTE.get(stressor, FALLBACK_COLOR)] * (len(sc) - 1))
 
     fig, ax = plt.subplots(figsize=(max(7, len(sc) * 1.2), 5))
-    bp = ax.boxplot(box_data, labels=labels, patch_artist=True)
+    bp = ax.boxplot(box_data, tick_labels=labels, patch_artist=True)
     for patch, c in zip(bp["boxes"], colors):
         patch.set_facecolor(c); patch.set_alpha(0.7)
     ax.set_xlabel("Background Workers on vm-li (N)")
-    ax.set_ylabel("Per-Run Mean RTL (µs)")
-    ax.set_title(f"RTL Distribution per Condition — {stressor}  (run-to-run variance)")
+    ax.set_ylabel("Per-Run Mean RTT (µs)")
+    ax.set_title(f"RTT Distribution per Condition — {stressor}  (run-to-run variance)")
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
-    _save(fig, os.path.join(out, f"rtl_boxplot{suffix}.png"))
+    _save(fig, os.path.join(out, f"rtt_boxplot{suffix}.png"))
     plt.close(fig)
 
 
@@ -517,7 +737,7 @@ def plot_jitter(conditions, out, stressor, suffix=""):
     import matplotlib.pyplot as plt
     n_vals, sc = _sorted_sc(conditions)
     labels  = [str(n) for n in n_vals]
-    jitters = [_avg(c["runs"], "rtl_stddev_us") for c in sc]
+    jitters = [_avg(c["runs"], "rtt_stddev_us") for c in sc]
     color   = STRESSOR_PALETTE.get(stressor, FALLBACK_COLOR)
 
     fig, ax = plt.subplots(figsize=(max(7, len(sc) * 1.2), 5))
@@ -527,39 +747,84 @@ def plot_jitter(conditions, out, stressor, suffix=""):
         ax.axhline(thr, linestyle="--", color="red", alpha=0.7,
                    label=f"{DEGRADATION_JITTER_FACTOR}x baseline ({thr:.1f} µs)")
     ax.set_xlabel("Background Workers on vm-li (N)")
-    ax.set_ylabel("RTL Std Dev (µs)")
-    ax.set_title(f"RTL Jitter vs Load — {stressor}  (H1)")
+    ax.set_ylabel("RTT Std Dev (µs)")
+    ax.set_title(f"RTT Jitter vs Load — {stressor}  (H1)")
     ax.legend(); ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
-    _save(fig, os.path.join(out, f"rtl_jitter{suffix}.png"))
+    _save(fig, os.path.join(out, f"rtt_jitter{suffix}.png"))
     plt.close(fig)
 
-# ─── Cross-variant plots (H5) ─────────────────────────────────────────────────
+def plot_p999_trend(conditions, out, stressor, suffix=""):
+    """P99.9 RTT vs N with bootstrap 99% CI  —  primary H0/H1 metric plot."""
+    import matplotlib.pyplot as plt
+    n_vals, sc = _sorted_sc(conditions)
+    color = STRESSOR_PALETTE.get(stressor, FALLBACK_COLOR)
+
+    medians, ci_los, ci_his = [], [], []
+    for c in sc:
+        p999_vals = _vals(c["runs"], "rtt_p999_us")
+        if len(p999_vals) >= 2:
+            lo, hi, med = _bootstrap_ci_single(p999_vals)
+        else:
+            med = p999_vals[0] if p999_vals else float("nan")
+            lo, hi = med, med
+        medians.append(med)
+        ci_los.append(med - lo)
+        ci_his.append(hi - med)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.errorbar(n_vals, medians, yerr=[ci_los, ci_his],
+                fmt="o-", capsize=5, color=color, linewidth=2, markersize=7,
+                label=f"median P99.9 RTT  ±  {CONF_LEVEL*100:.0f}% bootstrap CI")
+    ax.axhline(y=ECHO_TIMEOUT_US, color="red", linestyle="--", linewidth=1,
+               label=f"Echo timeout ({ECHO_TIMEOUT_US/1000:.0f} ms)")
+    ax.set_xlabel("Background Workers on vm-li (N)")
+    ax.set_ylabel("P99.9 RTT (µs)")
+    ax.set_title(f"P99.9 RTT vs Load — {stressor}  (H0/H1)")
+    ax.set_xticks(n_vals); ax.legend(); ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+    _save(fig, os.path.join(out, f"p999_trend{suffix}.png"))
+    plt.close(fig)
+
+
+# ─── Cross-configuration plots (H3/H4) ───────────────────────────────────────────────
 
 def plot_overlay(proxy_conds, hicom_conds, out, stressor):
-    """Mean RTL +/- std for both variants on same axes — primary H5 figure."""
+    """Median P99.9 RTT + bootstrap CI for both configurations  —  primary H3 figure."""
     import matplotlib.pyplot as plt
 
     def _extract(conds):
         sc = sorted(conds.values(), key=lambda x: x["n_workers"])
-        return (
-            [c["n_workers"]                        for c in sc],
-            [_avg(c["runs"], "rtl_mean_us")          for c in sc],
-            [_std_across_runs(c["runs"], "rtl_mean_us") for c in sc],
-        )
+        ns, meds, los, his = [], [], [], []
+        for c in sc:
+            p999_vals = _vals(c["runs"], "rtt_p999_us")
+            if len(p999_vals) >= 2:
+                lo, hi, med = _bootstrap_ci_single(p999_vals)
+            else:
+                med = p999_vals[0] if p999_vals else float("nan")
+                lo, hi = med, med
+            ns.append(c["n_workers"])
+            meds.append(med)
+            los.append(med - lo)
+            his.append(hi - med)
+        return ns, meds, los, his
 
-    pn, pm, ps = _extract(proxy_conds)
-    hn, hm, hs = _extract(hicom_conds)
+    pn, pm, p_lo, p_hi = _extract(proxy_conds)
+    hn, hm, h_lo, h_hi = _extract(hicom_conds)
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.errorbar(pn, pm, yerr=ps, fmt="o-",  capsize=5, color=PROXY_COLOR,
-                linewidth=2, markersize=7, label="Variant A — proxycomshm")
-    ax.errorbar(hn, hm, yerr=hs, fmt="s--", capsize=5, color=HICOM_COLOR,
-                linewidth=2, markersize=7, label="Variant B — hicom (HI-only)")
+    ax.errorbar(pn, pm, yerr=[p_lo, p_hi], fmt="o-",  capsize=5, color=PROXY_COLOR,
+                linewidth=2, markersize=7,
+                label=f"Configuration A — proxycomshm  (median P99.9 ± {CONF_LEVEL*100:.0f}% CI)")
+    ax.errorbar(hn, hm, yerr=[h_lo, h_hi], fmt="s--", capsize=5, color=HICOM_COLOR,
+                linewidth=2, markersize=7,
+                label=f"Configuration B — hicom  (median P99.9 ± {CONF_LEVEL*100:.0f}% CI)")
+    ax.axhline(y=ECHO_TIMEOUT_US, color="red", linestyle="--", linewidth=1,
+               label=f"Echo timeout ({ECHO_TIMEOUT_US/1000:.0f} ms)")
     ax.set_xlabel("Background Workers on vm-li (N)")
-    ax.set_ylabel("Mean RTL (µs)")
-    ax.set_title(f"Cross-Variant RTL Comparison — {stressor}  (H5)\n"
-                 "Vertical gap = contribution of vm-li direct channel participation")
+    ax.set_ylabel("P99.9 RTT (µs)")
+    ax.set_title(f"Cross-Configuration P99.9 RTT Comparison — {stressor}  (H3)\n"
+                 f"Vertical gap = LI VM channel exposure  |  error bars = bootstrap {CONF_LEVEL*100:.0f}% CI")
     ax.set_xticks(sorted(set(pn) | set(hn)))
     ax.legend(); ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
@@ -567,8 +832,8 @@ def plot_overlay(proxy_conds, hicom_conds, out, stressor):
     plt.close(fig)
 
 
-def plot_rtl_ratio(proxy_conds, hicom_conds, out, stressor):
-    """RTL ratio (hicom / proxycomshm) vs N — isolation effectiveness."""
+def plot_rtt_ratio(proxy_conds, hicom_conds, out, stressor):
+    """RTT ratio (hicom / proxycomshm) vs N — isolation effectiveness."""
     import matplotlib.pyplot as plt
 
     proxy_by_n = {v["n_workers"]: v for v in proxy_conds.values()}
@@ -577,8 +842,8 @@ def plot_rtl_ratio(proxy_conds, hicom_conds, out, stressor):
 
     ratios = []
     for n in common_n:
-        pm = _avg(proxy_by_n[n]["runs"], "rtl_mean_us")
-        hm = _avg(hicom_by_n[n]["runs"],  "rtl_mean_us")
+        pm = _avg(proxy_by_n[n]["runs"], "rtt_mean_us")
+        hm = _avg(hicom_by_n[n]["runs"],  "rtt_mean_us")
         ratios.append(hm / pm if pm > 0 else 0.0)
 
     fig, ax = plt.subplots(figsize=(9, 5))
@@ -586,17 +851,17 @@ def plot_rtl_ratio(proxy_conds, hicom_conds, out, stressor):
     ax.axhline(1.0, linestyle="--", color="grey", alpha=0.5,
                label="ratio = 1.0  (equal impact on both channels)")
     ax.set_xlabel("Background Workers on vm-li (N)")
-    ax.set_ylabel("RTL ratio  (hicom / proxycomshm)")
-    ax.set_title(f"Isolation Effectiveness — {stressor}  (H5)\n"
+    ax.set_ylabel("RTT ratio  (hicom / proxycomshm)")
+    ax.set_title(f"Isolation Effectiveness — {stressor}  (H4)\n"
                  "Decreasing ratio: hicom increasingly less affected than proxycomshm")
     ax.set_xticks(common_n); ax.legend(); ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
-    _save(fig, os.path.join(out, f"rtl_ratio_{stressor}.png"))
+    _save(fig, os.path.join(out, f"rtt_ratio_{stressor}.png"))
     plt.close(fig)
 
 
 def plot_side_by_side_boxplot(proxy_conds, hicom_conds, out, stressor):
-    """Side-by-side box plots per N for both variants."""
+    """Side-by-side box plots per N for both configurations."""
     import matplotlib.pyplot as plt
     try:
         import numpy as np
@@ -612,8 +877,8 @@ def plot_side_by_side_boxplot(proxy_conds, hicom_conds, out, stressor):
 
     pos    = np.arange(len(common_n))
     width  = 0.35
-    p_data = [_vals(proxy_by_n[n]["runs"], "rtl_mean_us") for n in common_n]
-    h_data = [_vals(hicom_by_n[n]["runs"],  "rtl_mean_us") for n in common_n]
+    p_data = [_vals(proxy_by_n[n]["runs"], "rtt_mean_us") for n in common_n]
+    h_data = [_vals(hicom_by_n[n]["runs"],  "rtt_mean_us") for n in common_n]
 
     fig, ax = plt.subplots(figsize=(max(9, len(common_n) * 1.6), 5))
     bp1 = ax.boxplot(p_data, positions=pos - width / 2, widths=width,
@@ -629,75 +894,223 @@ def plot_side_by_side_boxplot(proxy_conds, hicom_conds, out, stressor):
     ax.set_xticks(pos)
     ax.set_xticklabels([str(n) for n in common_n])
     ax.set_xlabel("Background Workers on vm-li (N)")
-    ax.set_ylabel("Per-Run Mean RTL (µs)")
-    ax.set_title(f"RTL Distribution Comparison — {stressor}")
+    ax.set_ylabel("Per-Run Mean RTT (µs)")
+    ax.set_title(f"RTT Distribution Comparison — {stressor}")
     ax.legend(handles=[
-        Patch(facecolor=PROXY_COLOR, alpha=0.6, label="Variant A — proxycomshm"),
-        Patch(facecolor=HICOM_COLOR, alpha=0.6, label="Variant B — hicom"),
+        Patch(facecolor=PROXY_COLOR, alpha=0.6, label="Configuration A — proxycomshm"),
+        Patch(facecolor=HICOM_COLOR, alpha=0.6, label="Configuration B — hicom"),
     ])
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
     _save(fig, os.path.join(out, f"boxplot_comparison_{stressor}.png"))
     plt.close(fig)
 
-# ─── H4 payload size ──────────────────────────────────────────────────────────
-
-def plot_h4_payload_size(h4_results, out):
-    """Scatter + linear fit of mean RTL vs payload bytes — H4."""
+def plot_loss_rate_comparison(proxy_conds, hicom_conds, out, stressor):
+    """Grouped bar chart of message loss rate for both configurations."""
     import matplotlib.pyplot as plt
+    try:
+        import numpy as np
+    except ImportError:
+        print("  [numpy unavailable — skipping loss rate comparison]")
+        return
 
-    sp            = _scipy()
-    payload_sizes = sorted(h4_results.keys())
-    means         = [_avg(h4_results[p], "rtl_mean_us")             for p in payload_sizes]
-    errs          = [_std_across_runs(h4_results[p], "rtl_mean_us") for p in payload_sizes]
+    from matplotlib.patches import Patch
 
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.errorbar(payload_sizes, means, yerr=errs, fmt="o",
-                color="#FF9800", capsize=5, markersize=8, zorder=3)
+    proxy_by_n = {v["n_workers"]: v for v in proxy_conds.values()}
+    hicom_by_n = {v["n_workers"]: v for v in hicom_conds.values()}
+    common_n   = sorted(set(proxy_by_n) & set(hicom_by_n))
 
-    if sp and len(payload_sizes) >= 2:
-        lr = sp.linregress(payload_sizes, means)
-        fit_x = [min(payload_sizes), max(payload_sizes)]
-        fit_y = [lr.slope * x + lr.intercept for x in fit_x]
-        ax.plot(fit_x, fit_y, "--", color="#F44336", linewidth=1.5,
-                label=f"Linear fit: {lr.slope:.5f} µs/B  (R2 = {lr.rvalue**2:.3f})")
-        ax.legend()
+    def _loss_pct(cond):
+        sent = sum(r.get("n_sent", 0) for r in cond["runs"])
+        lost = sum(r.get("n_lost", 0) for r in cond["runs"])
+        return lost / sent * 100 if sent else 0.0
 
-        baseline = means[0] if means else 1.0
-        effect   = lr.slope * 3072
-        h4_ok    = effect < 0.1 * baseline
-        sep = "─" * 62
-        print(f"\n{sep}")
-        print(f"  H4 — Payload Size Analysis")
-        print(sep)
-        print(f"  Slope:                  {lr.slope:.6f} µs/B")
-        print(f"  Predicted effect @3072B: {effect:.2f} µs"
-              f"  ({effect / baseline * 100:.1f}% of baseline mean)")
-        print(f"  R2:                     {lr.rvalue**2:.3f}")
-        print(f"  -> H4 {'CONFIRMED  [size effect < 10% of baseline mean]' if h4_ok else 'NOT confirmed'}")
+    p_rates = [_loss_pct(proxy_by_n[n]) for n in common_n]
+    h_rates = [_loss_pct(hicom_by_n[n]) for n in common_n]
 
-    ax.set_xlabel("Message Payload Size (bytes) — log scale")
-    ax.set_ylabel("Mean RTL (µs)")
-    ax.set_title("Mean RTL vs Payload Size  (N=0 baseline, H4)\n"
-                 "Flat slope -> latency dominated by polling, not data copy")
-    ax.set_xscale("log")
+    pos   = np.arange(len(common_n))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(max(7, len(common_n) * 1.6), 5))
+    ax.bar(pos - width / 2, p_rates, width, color=PROXY_COLOR, alpha=0.8,
+           edgecolor="black", label="Configuration A — proxycomshm")
+    ax.bar(pos + width / 2, h_rates, width, color=HICOM_COLOR, alpha=0.8,
+           edgecolor="black", label="Configuration B — hicom")
+    ax.set_xticks(pos)
+    ax.set_xticklabels([str(n) for n in common_n])
+    ax.set_xlabel("Background Workers on vm-li (N)")
+    ax.set_ylabel("Message Loss Rate (%)")
+    ax.set_title(f"Message Loss Rate — {stressor}  (H3: should be 0%)")
+    ax.legend(handles=[
+        Patch(facecolor=PROXY_COLOR, alpha=0.8, label="Configuration A — proxycomshm"),
+        Patch(facecolor=HICOM_COLOR, alpha=0.8, label="Configuration B — hicom"),
+    ])
     ax.grid(axis="y", alpha=0.3)
+    if max(p_rates + h_rates, default=0) == 0:
+        ax.set_ylim(0, 1)
+        ax.text(0.5, 0.5, "No message loss detected",
+                transform=ax.transAxes, ha="center", va="center",
+                fontsize=13, color="green", fontweight="bold")
     fig.tight_layout()
-    _save(fig, os.path.join(out, "h4_payload_size.png"))
+    _save(fig, os.path.join(out, f"loss_rate_comparison_{stressor}.png"))
     plt.close(fig)
 
+
+def generate_timeseries_plots(ts_data, output_dir):
+    """Generate per-run time-series plots (RTT + optional vmstat panels).
+
+    RTT data is indexed by sequence number; vmstat data is indexed by wall-clock
+    second.  When vmstat is present the sequence numbers are linearly mapped onto
+    the vmstat duration so that all panels share a common time axis.  The mapping
+    assumes a roughly uniform message rate, which is valid for a tight ping loop;
+    vmstat is 1-second granularity so sub-second errors are invisible.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("WARNING: matplotlib not installed. Skipping time-series plots.")
+        print("Install with: pip3 install matplotlib")
+        return
+    os.makedirs(output_dir, exist_ok=True)
+
+    def _sort_key(item):
+        cname = item[0]
+        sep   = cname.rfind("_")
+        st    = cname[:sep] if sep != -1 else cname
+        return (STRESSOR_ORDER.index(st) if st in STRESSOR_ORDER else 99, cname)
+
+    for cond_name, run_entries in sorted(ts_data.items(), key=_sort_key):
+        sep      = cond_name.rfind("_")
+        stressor = cond_name[:sep] if sep != -1 else cond_name
+        color    = STRESSOR_PALETTE.get(stressor, FALLBACK_COLOR)
+
+        for cycles, vmstat, speedom_vmstat, run_num in run_entries:
+            if not cycles:
+                continue
+
+            has_vmstat  = bool(vmstat)
+            has_speedom = bool(speedom_vmstat)
+
+            ts_rtt = [s["Seq"] for s in cycles]
+            rtt_us = [s["RTT_ns"] / 1000.0 for s in cycles]
+
+            nrows = 1 + (2 if has_vmstat else 0) + (2 if has_speedom else 0)
+            # RTT uses sequence numbers; vmstat uses wall-clock seconds.
+            # sharex=False keeps the axes independent so both are legible.
+            fig, axes = plt.subplots(nrows, 1, figsize=(14, 4 * nrows), sharex=False)
+            if nrows == 1:
+                axes = [axes]
+
+            # ── Panel 0: RTT timeline ──────────────────────────────────────
+            ax_rtt = axes[0]
+            ax_rtt.plot(ts_rtt, rtt_us, linewidth=0.8, color=color, label="RTT")
+            ax_rtt.axhline(y=ECHO_TIMEOUT_US, color="red", linestyle="--",
+                           linewidth=1,
+                           label=f"Echo timeout ({ECHO_TIMEOUT_US / 1000:.0f} ms)")
+            ax_rtt.set_ylabel("RTT (µs)")
+            ax_rtt.set_title(f"{cond_name} — Run {run_num}")
+            ax_rtt.set_xlabel("Sequence #")
+            ax_rtt.legend(loc="upper right", fontsize=8)
+            ax_rtt.grid(alpha=0.3)
+
+            if has_vmstat:
+                vm_ts = [r["timestamp_s"] for r in vmstat]
+
+                # ── Panel 1: vm-li CPU breakdown ───────────────────────────
+                ax_cpu = axes[1]
+                ax_cpu.stackplot(vm_ts,
+                                 [r.get("us", 0) for r in vmstat],
+                                 [r.get("sy", 0) for r in vmstat],
+                                 [r.get("id", 0) for r in vmstat],
+                                 tick_labels=["User (us)", "System (sy)", "Idle (id)"],
+                                 colors=["#FF9800", "#F44336", "#E0E0E0"], alpha=0.8)
+                ax_cpu.set_ylabel("vm-li CPU %")
+                ax_cpu.set_xlabel("Time (s)")
+                ax_cpu.set_ylim(0, 105)
+                ax_cpu.legend(loc="upper right", fontsize=8)
+                ax_cpu.grid(alpha=0.3)
+
+                # ── Panel 2: vm-li system metrics ──────────────────────────
+                ax_sys = axes[2]
+                ax_sys.plot(vm_ts, [r.get("in", 0) for r in vmstat],
+                            linewidth=1, color="#9C27B0", label="Interrupts/s (in)")
+                ax_sys.set_ylabel("Interrupts/s", color="#9C27B0")
+                ax_sys.tick_params(axis="y", labelcolor="#9C27B0")
+
+                ax_cs = ax_sys.twinx()
+                ax_cs.plot(vm_ts, [r.get("cs", 0) for r in vmstat],
+                           linewidth=1, color="#2196F3", label="Ctx Switches/s (cs)")
+                ax_cs.set_ylabel("Ctx Switches/s", color="#2196F3")
+                ax_cs.tick_params(axis="y", labelcolor="#2196F3")
+
+                lines1, labs1 = ax_sys.get_legend_handles_labels()
+                lines2, labs2 = ax_cs.get_legend_handles_labels()
+                ax_sys.legend(lines1 + lines2, labs1 + labs2,
+                              loc="upper right", fontsize=8)
+                if not has_speedom:
+                    ax_sys.set_xlabel("Time (s)")
+                ax_sys.grid(alpha=0.3)
+
+            if has_speedom:
+                row_offset = 3 if has_vmstat else 1
+                sp_ts = [r["timestamp_s"] for r in speedom_vmstat]
+
+                # ── Panel row_offset: vm-hi CPU breakdown ──────────────────
+                ax_sp_cpu = axes[row_offset]
+                ax_sp_cpu.stackplot(sp_ts,
+                                    [r.get("us", 0) for r in speedom_vmstat],
+                                    [r.get("sy", 0) for r in speedom_vmstat],
+                                    [r.get("id", 0) for r in speedom_vmstat],
+                                    tick_labels=["User (us)", "System (sy)", "Idle (id)"],
+                                    colors=["#FF9800", "#F44336", "#E0E0E0"], alpha=0.8)
+                ax_sp_cpu.set_ylabel("vm-hi CPU %")
+                ax_sp_cpu.set_ylim(0, 105)
+                ax_sp_cpu.legend(loc="upper right", fontsize=8)
+                ax_sp_cpu.grid(alpha=0.3)
+
+                # ── Panel row_offset+1: vm-hi system metrics ───────────────
+                ax_sp_sys = axes[row_offset + 1]
+                ax_sp_sys.plot(sp_ts, [r.get("in", 0) for r in speedom_vmstat],
+                               linewidth=1, color="#9C27B0",
+                               label="Interrupts/s (in)")
+                ax_sp_sys.set_ylabel("vm-hi Interrupts/s", color="#9C27B0")
+                ax_sp_sys.tick_params(axis="y", labelcolor="#9C27B0")
+
+                ax_sp_cs = ax_sp_sys.twinx()
+                ax_sp_cs.plot(sp_ts, [r.get("cs", 0) for r in speedom_vmstat],
+                              linewidth=1, color="#2196F3",
+                              label="Ctx Switches/s (cs)")
+                ax_sp_cs.set_ylabel("vm-hi Ctx Switches/s", color="#2196F3")
+                ax_sp_cs.tick_params(axis="y", labelcolor="#2196F3")
+
+                lines1, labs1 = ax_sp_sys.get_legend_handles_labels()
+                lines2, labs2 = ax_sp_cs.get_legend_handles_labels()
+                ax_sp_sys.legend(lines1 + lines2, labs1 + labs2,
+                                 loc="upper right", fontsize=8)
+                ax_sp_sys.set_xlabel("Time (s)")
+                ax_sp_sys.grid(alpha=0.3)
+
+            elif not has_vmstat:
+                pass  # RTT panel already has its x-label set above
+
+            fig.tight_layout()
+            fname = os.path.join(output_dir,
+                                 f"timeseries_{cond_name}_run{run_num}.png")
+            fig.savefig(fname, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  Saved: {fname}")
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scenario 2 RTL analysis — plots and statistical tests"
+        description="Scenario 2 RTT analysis — plots and statistical tests"
     )
     parser.add_argument("-r", "--results-dir", required=True,
-                        help="Variant A (proxycomshm) results directory")
+                        help="Configuration A (proxycomshm) results directory")
     parser.add_argument("--hicom-dir", default=None,
-                        help="Variant B (hicom) results dir — enables H5 cross-variant analysis")
-    parser.add_argument("--h4-dir", default=None,
-                        help="H4 payload-size results directory  (subdirs: 16B/ 64B/ etc.)")
+                        help="Configuration B (hicom) results dir — enables H4 cross-configuration analysis")
     parser.add_argument("--stressor", default=None,
                         help="Restrict to one stressor type (e.g. cache, stream, cpu)")
     parser.add_argument("-o", "--output-dir", default=None,
@@ -716,14 +1129,12 @@ def main():
     print("=" * 62)
     print("  Scenario 2 Analysis — Inter-VM Communication Latency")
     print("=" * 62)
-    print(f"  Variant A:  {args.results_dir}")
+    print(f"  Configuration A:  {args.results_dir}")
     if args.hicom_dir:
-        print(f"  Variant B:  {args.hicom_dir}")
-    if args.h4_dir:
-        print(f"  H4:         {args.h4_dir}")
+        print(f"  Configuration B:  {args.hicom_dir}")
     print(f"  Output:     {out}")
 
-    # ── Load Variant A ────────────────────────────────────────────────────
+    # ── Load Configuration A ────────────────────────────────────────────────────
     proxy_all = discover_conditions(args.results_dir)
     if not proxy_all:
         sys.exit(
@@ -733,28 +1144,40 @@ def main():
 
     s_types = stressor_types(proxy_all)
     total   = sum(len(v["runs"]) for v in proxy_all.values())
-    print(f"\nVariant A: {total} runs, {len(proxy_all)} conditions, "
+    print(f"\nConfiguration A: {total} runs, {len(proxy_all)} conditions, "
           f"stressors: {', '.join(s_types)}")
-    print_summary_table(proxy_all, label="Variant A — proxycomshm")
+    print_summary_table(proxy_all, label="Configuration A — proxycomshm")
 
     to_plot = [args.stressor] if args.stressor else s_types
 
-    print("\nVariant A plots and tests...")
+    # Statistical tests (H0–H3) — run once over all Configuration A conditions
+    run_statistical_tests(proxy_all, label="Configuration A")
+
+    # Load time-series data
+    ts_data = load_timeseries(args.results_dir)
+    ts_runs = sum(len(runs) for runs in ts_data.values())
+    print(f"\nLoaded time-series data for {ts_runs} runs.")
+    
+    
+    print("\nGenerating per-stressor N-trend plots (Configuration A)...")
     for st in to_plot:
         conds = for_stressor(proxy_all, st)
         if len(conds) < 2:
             print(f"  [{st}: fewer than 2 conditions — skipped]")
             continue
         sfx = f"_{st}"
-        plot_mean_rtl(conds,    out, st, sfx)
+        plot_p999_trend(conds, out, st, sfx)
+        plot_mean_rtt(conds,    out, st, sfx)
         plot_percentiles(conds, out, st, sfx)
-        plot_tail_ratio(conds,  out, st, sfx)
         plot_boxplot(conds,     out, st, sfx)
         plot_loss_rate(conds,   out, st, sfx)
         plot_jitter(conds,      out, st, sfx)
-        test_per_variant(conds, label=f"Variant A — {st}")
 
-    # ── Variant B and cross-variant (H5) ──────────────────────────────────
+    # if ts_data:
+    #     print("\nGenerating time-series plots...")
+    #     generate_timeseries_plots(ts_data, out)
+
+    # Configuration B and cross-configuration (H4)
     if args.hicom_dir:
         hicom_all = discover_conditions(args.hicom_dir)
         if not hicom_all:
@@ -762,50 +1185,40 @@ def main():
         else:
             h_types = stressor_types(hicom_all)
             h_total = sum(len(v["runs"]) for v in hicom_all.values())
-            print(f"\nVariant B: {h_total} runs, {len(hicom_all)} conditions, "
+            print(f"\nConfiguration B: {h_total} runs, {len(hicom_all)} conditions, "
                   f"stressors: {', '.join(h_types)}")
-            print_summary_table(hicom_all, label="Variant B — hicom")
+            print_summary_table(hicom_all, label="Configuration B — hicom")
 
-            # Cross-variant analysis for stressors present in both result sets
+            # Statistical tests for Configuration B
+            run_statistical_tests(hicom_all, label="Configuration B")
+
+            # Cross-configuration analysis for stressors present in both result sets
             cv_stressors = [s for s in to_plot
                             if any(v["stressor"] == s for v in hicom_all.values())]
 
             if cv_stressors:
-                print("\nCross-variant plots and tests (H5)...")
+                print("\nCross-configuration plots and tests (H4)...")
             for st in cv_stressors:
                 p_conds = for_stressor(proxy_all, st)
                 h_conds = for_stressor(hicom_all, st)
                 if len(p_conds) < 2 or len(h_conds) < 2:
                     continue
                 plot_overlay(p_conds, h_conds, out, st)
-                plot_rtl_ratio(p_conds, h_conds, out, st)
+                plot_rtt_ratio(p_conds, h_conds, out, st)
                 plot_side_by_side_boxplot(p_conds, h_conds, out, st)
-                test_cross_variant(p_conds, h_conds, st)
+                plot_loss_rate_comparison(p_conds, h_conds, out, st)
+                test_cross_configuration(p_conds, h_conds, st)
 
-            # Standalone Variant B N-trend plots
-            print("\nVariant B standalone plots...")
+            # Standalone Configuration B N-trend plots
+            print("\nConfiguration B standalone plots...")
             for st in (cv_stressors or h_types):
                 h_conds = for_stressor(hicom_all, st)
                 if len(h_conds) < 2:
                     continue
                 sfx = f"_hicom_{st}"
-                plot_mean_rtl(h_conds, out, st, sfx)
-                plot_jitter(h_conds,   out, st, sfx)
-                test_per_variant(h_conds, label=f"Variant B — {st}")
-
-    # ── H4 payload size ───────────────────────────────────────────────────
-    if args.h4_dir:
-        print("\nH4 payload size analysis...")
-        h4 = load_h4_results(args.h4_dir)
-        if not h4:
-            print(f"  WARNING: no results found in {args.h4_dir}")
-            print("  Expected subdirs: 16B/  64B/  512B/  3072B/")
-        else:
-            print(f"  Payload sizes found: {sorted(h4.keys())} B")
-            plot_h4_payload_size(h4, out)
-
-    print(f"\nDone.  Plots saved to: {out}")
-
+                plot_p999_trend(h_conds, out, st, sfx)
+                plot_mean_rtt(h_conds,   out, st, sfx)
+                plot_jitter(h_conds,     out, st, sfx)
 
 if __name__ == "__main__":
     main()

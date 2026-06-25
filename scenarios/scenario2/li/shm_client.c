@@ -7,9 +7,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stdbool.h>
-#include <signal.h>
 #include <math.h>
-#include <sys/wait.h>
 
 #include "shmlib_proxyshm.h"
 #include "shmlib_ringbuffer.h"
@@ -48,8 +46,7 @@ static uint64_t percentile(const uint64_t *sorted, size_t n, double p)
 }
 
 static void print_and_save_stats(const uint64_t *rtl_ns, size_t n_stored,
-                                  uint64_t n_sent, uint64_t n_lost,
-                                  const char *csv_file)
+                                  uint64_t n_sent, uint64_t n_lost)
 {
     if (n_stored == 0) {
         printf("No RTL samples collected.\n");
@@ -97,18 +94,12 @@ static void print_and_save_stats(const uint64_t *rtl_ns, size_t n_stored,
     printf("Throughput: %.0f msg/s\n", throughput);
     printf("============================================\n");
 
-    /* Write CSV (seq, rtl_us columns).  Lost messages are omitted. */
-    FILE *fp = fopen(csv_file, "w");
-    if (!fp) {
-        printf("Warning: could not open CSV file '%s': %s\n",
-               csv_file, strerror(errno));
-        return;
+    printf("===CSV_START===\n");
+    printf("Seq,RTT_ns\n");
+    for (size_t i = 0; i < n_stored; i++)  {      
+        printf("%zu,%llu\n", i + 1, (unsigned long long)rtl_ns[i]);
     }
-    fprintf(fp, "seq,rtl_us\n");
-    for (size_t i = 0; i < n_stored; i++)
-        fprintf(fp, "%zu,%.3f\n", i, (double)rtl_ns[i] / 1e3);
-    fclose(fp);
-    printf("CSV written to: %s\n", csv_file);
+    printf("===CSV_END===\n");
 }
 
 /* ── Ring-buffer drain ─────────────────────────────────────────────────── */
@@ -126,33 +117,18 @@ static void drain_ring_buffer(struct shmlib_ring_buffer *buf)
 
 int main(int argc, char *argv[])
 {
-    int n_messages    = 1000;
-    int cache_workers = 0;
-    int stream_workers = 0;
-    const char *csv_file = "shm_client_log.csv";
-
+    int n_messages = 1000;
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
         if ((strcmp(argv[i], "-n") == 0) && i + 1 < argc) {
             n_messages = atoi(argv[++i]);
-        } else if ((strcmp(argv[i], "-C") == 0 ||
-                    strcmp(argv[i], "--cache") == 0) && i + 1 < argc) {
-            cache_workers = atoi(argv[++i]);
-        } else if ((strcmp(argv[i], "-S") == 0 ||
-                    strcmp(argv[i], "--stream") == 0) && i + 1 < argc) {
-            stream_workers = atoi(argv[++i]);
-        } else if ((strcmp(argv[i], "-o") == 0) && i + 1 < argc) {
-            csv_file = argv[++i];
-        } else if (strcmp(argv[i], "-h") == 0 ||
+        } 
+        else if (strcmp(argv[i], "-h") == 0 ||
                    strcmp(argv[i], "--help") == 0) {
             printf("Usage: %s [options]\n", argv[0]);
-            printf("  -n <count>    Ping messages to send (default: 1000)\n");
-            printf("  -C <workers>  stress-ng --cache workers (default: 0)\n");
-            printf("  -S <workers>  stress-ng --stream workers (default: 0)\n");
-            printf("  -o <file>     Output CSV path (default: shm_client_log.csv)\n");
-            printf("  -h            Show this help\n");
-            printf("\nMessage size: %zu B  (PING_PAYLOAD_BYTES=%d)\n",
-                   sizeof(struct ping_message), PING_PAYLOAD_BYTES);
+            printf("  -n <count>  Ping messages to send (default: 1000)\n");
+            printf("  -h          Show this help\n");
+            printf("\nMessage size: %zu B  (PING_PAYLOAD_BYTES=%d)\n", sizeof(struct ping_message), PING_PAYLOAD_BYTES);
             return 0;
         }
     }
@@ -161,6 +137,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "ERROR: -n must be between 1 and %d\n", MAX_SAMPLES);
         return 1;
     }
+    
 
     printf("========================================\n");
     printf("SHM Ping-Pong Client\n");
@@ -168,8 +145,6 @@ int main(int argc, char *argv[])
     printf("========================================\n");
     printf("Messages:       %d\n", n_messages);
     printf("Message size:   %zu B\n", sizeof(struct ping_message));
-    printf("Cache workers:  %d\n", cache_workers);
-    printf("Stream workers: %d\n", stream_workers);
     printf("Poll interval:  %d us\n", POLL_INTERVAL_US);
     printf("Echo timeout:   %d ms\n", RTL_TIMEOUT_MS);
     printf("\n");
@@ -216,44 +191,7 @@ int main(int argc, char *argv[])
     drain_ring_buffer(&echo_app->li_to_hi);
     drain_ring_buffer(&echo_app->hi_to_li);
 
-    /* ── Start stress-ng background workers (if requested) ───────────── */
-
-    pid_t stress_pid = -1;
-    if (cache_workers > 0 || stream_workers > 0) {
-        char stress_cmd[512];
-        int offset = snprintf(stress_cmd, sizeof(stress_cmd), "stress-ng");
-
-        if (cache_workers > 0)
-            offset += snprintf(stress_cmd + offset, sizeof(stress_cmd) - offset,
-                               " --cache %d", cache_workers);
-        if (stream_workers > 0)
-            offset += snprintf(stress_cmd + offset, sizeof(stress_cmd) - offset,
-                               " --stream %d", stream_workers);
-
-        /* No --timeout: we kill the process explicitly when pings finish. */
-        snprintf(stress_cmd + offset, sizeof(stress_cmd) - offset,
-                 " --metrics-brief");
-
-        printf("Starting background stress: %s\n", stress_cmd);
-
-        stress_pid = fork();
-        if (stress_pid == 0) {
-            execl("/bin/sh", "sh", "-c", stress_cmd, NULL);
-            perror("execl failed");
-            exit(1);
-        } else if (stress_pid < 0) {
-            fprintf(stderr, "ERROR: fork failed: %s\n", strerror(errno));
-            return 1;
-        }
-
-        /* Allow stress-ng workers to ramp up before measurements begin. */
-        printf("Waiting 2s for stress-ng to ramp up...\n");
-        sleep(2);
-    }
-
     /* ── Ping-pong measurement loop ───────────────────────────────────── */
-
-    printf("Starting %d pings...\n\n", n_messages);
 
     static uint64_t rtl_ns[MAX_SAMPLES];
     size_t n_stored  = 0;
@@ -322,31 +260,17 @@ int main(int argc, char *argv[])
         }
 
         if (!got_echo) {
-            printf("WARNING: timeout waiting for echo at seq %d\n", seq);
+            // printf("WARNING: timeout waiting for echo at seq %d\n", seq);
             n_lost++;
             /* Drain any stale response that arrives late */
             drain_ring_buffer(&echo_app->hi_to_li);
         }
 
-        /* Progress update every 100 messages */
-        if ((seq + 1) % 100 == 0) {
-            printf("Progress: %d/%d pings (lost so far: %llu)\n",
-                   seq + 1, n_messages, (unsigned long long)n_lost);
-        }
-    }
-
-    /* ── Stop stress-ng ───────────────────────────────────────────────── */
-
-    if (stress_pid > 0) {
-        printf("\nStopping stress-ng (PID %d)...\n", (int)stress_pid);
-        kill(stress_pid, SIGTERM);
-        waitpid(stress_pid, NULL, 0);
-        printf("stress-ng stopped.\n");
     }
 
     /* ── Report results ───────────────────────────────────────────────── */
 
-    print_and_save_stats(rtl_ns, n_stored, n_sent, n_lost, csv_file);
+    print_and_save_stats(rtl_ns, n_stored, n_sent, n_lost);
 
     return (n_lost == 0) ? 0 : 1;
 }
