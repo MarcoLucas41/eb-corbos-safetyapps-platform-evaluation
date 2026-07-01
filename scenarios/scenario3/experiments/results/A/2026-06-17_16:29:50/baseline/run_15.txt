@@ -1,0 +1,41 @@
+========================================
+net_sender_li (pinger) — Scenario 3 reversed
+EB corbos Linux Network Determinism
+Metric: Round-Trip Latency (RTL)
+========================================
+Target:       10.0.1.1:5000
+Probes:       2000
+Protocol:     UDP
+Period:       1 ms
+Msg size:     64 B
+Flood rate:   0 Mbps
+Echo timeout: 10 ms
+
+net_sender_li: SCHED_FIFO OK (priority 90)
+Sending HELLO to 10.0.1.1:5000 (protocol=UDP)...
+HELLO_ACK received — protocol=UDP
+Starting ping-echo loop (2000 probes at 1 ms period)...
+
+
+========== NET SENDER_LI (PINGER) RESULTS ==========
+Probes sent:        2000
+Echoes received:       0
+Lost (no echo):     2000 (100.000%)
+Elapsed:           7.556 s
+RTL: no samples
+IAJ: no samples
+===CSV_START===
+index,send_time_ns,recv_time_ns,rtl_ns,iaj_ns
+===CSV_END===
+===================================================
+===VMSTAT_START===
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 1  0      0 148872   4708  30588    0    0    40    14  232  141 10 25 64  0  0
+ 1  0      0 148872   4708  30592    0    0     0     0  915  525  5 37 59  0  0
+ 1  0      0 148872   4708  30592    0    0     0     0  881  515  3 36 61  0  0
+ 1  0      0 148872   4716  30584    0    0     0   120  896  565  5 29 65  1  0
+ 1  0      0 148872   4716  30592    0    0     0     0  844  531  3 35 62  0  0
+ 1  0      0 148872   4716  30592    0    0     0     0  813  506  4 25 70  0  0
+ 0  0      0 148872   4716  30592    0    0     0     0  836  475  3 36 61  0  0
+===VMSTAT_END===

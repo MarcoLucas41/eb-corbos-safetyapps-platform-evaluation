@@ -1,0 +1,53 @@
+========================================
+net_sender_li (pinger) — Scenario 3 reversed
+EB corbos Linux Network Determinism
+Metric: Round-Trip Latency (RTL)
+========================================
+Target:       10.0.1.1:5000
+Probes:       2000
+Protocol:     UDP
+Period:       1 ms
+Msg size:     64 B
+Flood rate:   0 Mbps
+Echo timeout: 10 ms
+
+net_sender_li: SCHED_FIFO OK (priority 90)
+Sending HELLO to 10.0.1.1:5000 (protocol=UDP)...
+HELLO_ACK received — protocol=UDP
+Starting ping-echo loop (2000 probes at 1 ms period)...
+
+
+========== NET SENDER_LI (PINGER) RESULTS ==========
+Probes sent:        2000
+Echoes received:       4
+Lost (no echo):     1997 (99.850%)
+Elapsed:           7.160 s
+RTL (us):
+  Mean: 9552.124    Std dev: 1976.065
+  Min:  7760.256    Max:     12778.416
+  P50:  9531.616    P95:     12778.416
+  P99:  12778.416    P99.9:   12778.416
+IAJ (us):
+  Mean: 7947.392    Std dev: 638.224
+  Min:  7309.168    Max:     8585.616
+  P50:  8585.616    P95:     8585.616
+  P99:  8585.616    P99.9:   8585.616
+===CSV_START===
+index,send_time_ns,recv_time_ns,rtl_ns,iaj_ns
+0,859995856624,860003616880,7760256,7309168
+1,860003787840,860011926048,8138208,8585616
+2,860013039168,860025817584,12778416,0
+3,860025871584,860035403200,9531616,0
+===CSV_END===
+===================================================
+===VMSTAT_START===
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 8  0      0 118460   3348  35196    0    0    14    13  325  229 65 32  3  0  0
+ 9  0      0 118460   3348  35200    0    0     0     0 1218  837 37 63  0  0  0
+ 9  0      0 118460   3348  35200    0    0     0     0 1124  643 31 69  0  0  0
+ 9  0      0 118460   3348  35200    0    0     0     0 1145  565 25 75  0  0  0
+ 9  0      0 118460   3356  35192    0    0     0   120 1261  716 23 77  0  0  0
+ 9  0      0 118460   3356  35200    0    0     0     0 1305  644 22 78  0  0  0
+ 9  0      0 118460   3356  35200    0    0     0     0 1257  616 25 75  0  0  0
+===VMSTAT_END===

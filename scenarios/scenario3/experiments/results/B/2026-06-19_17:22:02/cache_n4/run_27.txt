@@ -1,0 +1,40 @@
+HI_NET_PING_START run=27
+Probes: 2000  |  Protocol: UDP  |  Period: 1 ms  |  Msg: 64 B
+hi_net_ping: sending HELLO to 127.0.0.1:5002 (protocol=UDP)...
+[echo] HELLO — protocol=UDP  n_probes=2000
+hi_net_ping: HELLO_ACK received
+[echo] HELLO_ACK sent
+hi_net_ping: starting ping-echo loop (2000 probes at 1 ms)...
+[echo] run #27 — echoing probes
+========== HI_NET_PING RESULTS ==========
+Probes sent:        2000
+Echoes received:      13
+Lost (no echo):     1987 (99.350%)
+RTL (us):
+Mean: 4093.494    Std dev: 1278.769
+Min:  3072.944    Max:     8134.128
+P50:  3833.504    P95:     8134.128
+P99:  8134.128    P99.9:   8134.128
+IAJ (us):
+Mean: 3404.391    Std dev: 1346.303
+Min:  2391.760    Max:     7612.464
+P50:  3159.184    P95:     7612.464
+P99:  7612.464    P99.9:   7612.464
+===CSV_START===
+index,rtl_ns,iaj_ns
+0,5110800,3238608
+1,3986256,3188800
+2,3851104,2391760
+3,3073072,7612464
+4,8134128,3033968
+5,3739104,2406672
+6,3072944,3527760
+7,3993392,2448912
+8,3158768,2986608
+9,3553936,2860464
+10,3492944,3159184
+11,3833504,3997488
+12,4215472,3226112
+===CSV_END===
+=========================================
+HI_NET_PING_DONE run=27

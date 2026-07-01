@@ -1,0 +1,57 @@
+========================================
+net_sender_li (pinger) — Scenario 3 reversed
+EB corbos Linux Network Determinism
+Metric: Round-Trip Latency (RTL)
+========================================
+Target:       10.0.1.1:5000
+Probes:       2000
+Protocol:     UDP
+Period:       1 ms
+Msg size:     64 B
+Flood rate:   0 Mbps
+Echo timeout: 10 ms
+
+net_sender_li: SCHED_FIFO OK (priority 90)
+Sending HELLO to 10.0.1.1:5000 (protocol=UDP)...
+HELLO_ACK received — protocol=UDP
+Starting ping-echo loop (2000 probes at 1 ms period)...
+
+
+========== NET SENDER_LI (PINGER) RESULTS ==========
+Probes sent:        2000
+Echoes received:       8
+Lost (no echo):     1992 (99.600%)
+Elapsed:           9.443 s
+RTL (us):
+  Mean: 6866.298    Std dev: 674.852
+  Min:  6196.464    Max:     8276.560
+  P50:  6782.656    P95:     8276.560
+  P99:  8276.560    P99.9:   8276.560
+IAJ (us):
+  Mean: 6089.634    Std dev: 768.056
+  Min:  5212.384    Max:     7293.968
+  P50:  5997.632    P95:     7293.968
+  P99:  7293.968    P99.9:   7293.968
+===CSV_START===
+index,send_time_ns,recv_time_ns,rtl_ns,iaj_ns
+0,883197420368,883204025056,6604688,6805568
+1,883205047968,883211830624,6782656,5997632
+2,883212024880,883218828256,6803376,5232128
+3,883218846352,883225060384,6214032,5212384
+4,883225076304,883231272768,6196464,6612384
+5,883231288832,883238885152,7596320,5473376
+6,883238902240,883245358528,6456288,7293968
+7,883245375936,883253652496,8276560,0
+===CSV_END===
+===================================================
+===VMSTAT_START===
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+18  0      0  92956  17544  37660    0    0    15    66  407  419 54 43  3  0  0
+18  0      0  92956  17544  37660    0    0     0     0  978  847 40 60  0  0  0
+14  4      0  92956  17544  37660    0    0     0     0  941  830 43 57  0  0  0
+15  4      0  92956  17544  37660    0    0     0     0  936  813 41 59  0  0  0
+18  2      0  92956  17544  37660    0    0     0     0  923  777 38 62  0  0  0
+18  1      0  92956  17544  37660    0    0     0     0  941  847 41 59  0  0  0
+17  2      0  92956  17544  37660    0    0     0     0  959  852 42 58  0  0  0
+===VMSTAT_END===

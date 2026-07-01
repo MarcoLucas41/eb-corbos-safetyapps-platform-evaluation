@@ -1,0 +1,19 @@
+HI_NET_PING_START run=16
+Probes: 2000  |  Protocol: UDP  |  Period: 1 ms  |  Msg: 64 B
+hi_net_ping: sending HELLO to 127.0.0.1:5002 (protocol=UDP)...
+[echo] HELLO — protocol=UDP  n_probes=2000
+hi_net_ping: HELLO_ACK received
+hi_net_ping: starting ping-echo loop (2000 probes at 1 ms)...
+[echo] HELLO_ACK sent
+[echo] run #16 — echoing probes
+========== HI_NET_PING RESULTS ==========
+Probes sent:        2000
+Echoes received:       0
+Lost (no echo):     2000 (100.000%)
+RTL: no samples
+IAJ: no samples
+===CSV_START===
+index,rtl_ns,iaj_ns
+===CSV_END===
+=========================================
+HI_NET_PING_DONE run=16
