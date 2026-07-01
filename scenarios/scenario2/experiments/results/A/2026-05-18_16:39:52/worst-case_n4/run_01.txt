@@ -1,0 +1,24 @@
+========================================
+SHM Ping-Pong Client
+Scenario 2 - EB corbos Linux Evaluation
+========================================
+Messages:       2000
+Message size:   64 B
+Poll interval:  100 us
+Echo timeout:   100 ms
+
+Waiting for shm_echo to register (UUID: b2c3d4e5-f6a7-8901-bcde-f12345678901)...
+Found shm_echo!
+
+
+========== SHM PING-PONG RESULTS ==========
+Messages sent:    2000
+Messages lost:    0 (0.000%)
+RTL (us):
+  Mean:   2254.818    Std dev: 1515.385
+  Min:      40.784    Max:     43020.848
+  P50:    1947.408    P95:     4140.288
+  P99:    6274.368    P99.9:   36260.912
+Throughput: 443 msg/s
+============================================
+CSV written to: shm_client_log.csv

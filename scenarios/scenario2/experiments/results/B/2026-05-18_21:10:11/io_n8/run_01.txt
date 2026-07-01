@@ -1,0 +1,13 @@
+HICOM_PING_START run=1
+Messages: 2000  |  Payload: 64 B  |  Channel: hicom (HI-only)
+========== SHM PING-PONG RESULTS ==========
+Messages sent:    2000
+Messages lost:    0 (0.000%)
+RTL (us):
+Mean:   2653.914    Std dev: 1325.143
+Min:     493.584    Max:     15887.440
+P50:    2849.232    P95:     4374.144
+P99:    5493.088    P99.9:   10537.824
+Throughput: 377 msg/s
+============================================
+HICOM_PING_DONE run=1

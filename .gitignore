@@ -13,11 +13,6 @@ speedometer
 *.swo
 *~
 
-scenarios/scenario1/experiments/results/*
-scenarios/scenario2/experiments/results/*
-scenarios/scenario3/experiments/results/*
-
-
 # Output files
 *.csv
 *.log
